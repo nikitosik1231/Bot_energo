@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$ConfigPath
 )
@@ -59,6 +59,20 @@ function Get-ArticleLinks([string]$Html, [uri]$BaseUri) {
             $uri = [uri]$url
             if ($uri.AbsolutePath -match '^/about/news/[^/]+$') { [void]$found.Add($url) }
         }
+    }
+    return $found
+}
+
+function Get-RssLinks([string]$Url) {
+    [xml]$rss = Get-Page $Url
+    $found = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in @($rss.rss.channel.item)) {
+        $link = [string]$item.link
+        if (-not $link) { continue }
+        try {
+            $uri = [uri]$link
+            if ($uri.AbsolutePath -match '^/about/news/[^/]+$') { [void]$found.Add($uri.AbsoluteUri) }
+        } catch { }
     }
     return $found
 }
@@ -200,8 +214,22 @@ Write-Host "Telegram: subscribers = $($state.subscribers.Count)"
 
 $newsUrl = if ($config.news_url) { $config.news_url } else { 'https://crimea-energy.ru/about/news' }
 Write-Host "Reading news: $newsUrl"
-$newsHtml = Get-Page $newsUrl
-$links = Get-ArticleLinks $newsHtml ([uri]$newsUrl)
+try {
+    $newsHtml = Get-Page $newsUrl
+    $links = Get-ArticleLinks $newsHtml ([uri]$newsUrl)
+} catch {
+    Write-Warning "Основная страница новостей недоступна: $($_.Exception.Message). Пробую RSS."
+    try {
+        $rssUrl = "$newsUrl?format=feed&type=rss"
+        $links = Get-RssLinks $rssUrl
+        Write-Host "RSS fallback: $rssUrl"
+    } catch {
+        Write-Warning "RSS также недоступен: $($_.Exception.Message)"
+        Save-State $state $statePath
+        Write-Host 'Done. The source will be retried on the next run.'
+        exit 0
+    }
+}
 Write-Host "News links found: $($links.Count)"
 $keywords = @('график', 'отключен', 'обесточ', 'планов', 'электроснабжен', 'энергоснабжен', 'аварийн', 'восстановительн')
 $newUrls = @($links | Where-Object { $state.sent_urls -notcontains $_ } | Select-Object -First 3)
