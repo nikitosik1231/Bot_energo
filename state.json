@@ -1,9 +1,8 @@
 {
-  "sent_urls": [
-    "https://crimea-energy.ru/about/news/13493-vnimanie-remontnye-raboty-4",
-    "https://crimea-energy.ru/about/news/13495-28-08-26"
+  "sent_urls": [],
+  "initialized": false,
+  "subscribers": [
+    -1004496706158
   ],
-  "initialized": true,
-  "subscribers": [],
-  "telegram_update_offset": 0
+  "telegram_update_offset": 147031965
 }
