@@ -18,8 +18,8 @@ $DefaultNewsUrl = 'https://crimea-energy.ru/about/news'
 
 # Один запрос может ждать сайт до 90 секунд.
 # Если сайт временно недоступен, статья будет запрашиваться снова.
-$RequestTimeoutSeconds = 90
-$RetryDelaySeconds = 10
+$RequestTimeoutSeconds = 15
+$RetryDelaySeconds = 5
 
 $RelevantKeywords = @(
     'график',
