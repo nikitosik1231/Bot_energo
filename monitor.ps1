@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$ConfigPath
 )
@@ -19,7 +19,7 @@ function Get-Page([string]$Url) {
     # A normal browser-like user agent is needed because the website may reject
     # generic HTTP clients.
     $headers = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36'; 'Accept-Language' = 'ru-RU,ru;q=0.9' }
-    return (Invoke-WebRequest -Uri $Url -Headers $headers -MaximumRedirection 5 -TimeoutSec 45 -UseBasicParsing).Content
+    return (Invoke-WebRequest -Uri $Url -Headers $headers -MaximumRedirection 5 -TimeoutSec 90 -UseBasicParsing).Content
 }
 
 function To-AbsoluteUrl([string]$Href, [uri]$BaseUri) {
@@ -145,17 +145,29 @@ function Receive-Subscribers($Config, $State) {
         $membership = $update.my_chat_member
         if ($channelPost) {
             $chatId = [long]$channelPost.chat.id
-            if ($State.subscribers -notcontains $chatId) { $State.subscribers += $chatId }
+            if ($State.subscribers -notcontains $chatId) {
+                $isFirstSubscriber = $State.subscribers.Count -eq 0
+                $State.subscribers += $chatId
+                if ($isFirstSubscriber) { $State.sent_urls = @(); $State.initialized = $false }
+            }
             continue
         }
         if ($membership -and $membership.chat.type -eq 'channel' -and $membership.new_chat_member.status -in @('administrator', 'member')) {
             $chatId = [long]$membership.chat.id
-            if ($State.subscribers -notcontains $chatId) { $State.subscribers += $chatId }
+            if ($State.subscribers -notcontains $chatId) {
+                $isFirstSubscriber = $State.subscribers.Count -eq 0
+                $State.subscribers += $chatId
+                if ($isFirstSubscriber) { $State.sent_urls = @(); $State.initialized = $false }
+            }
             continue
         }
         if ($message -and $message.text -match '^/start(?:\s|$)') {
             $chatId = [long]$message.chat.id
-            if ($State.subscribers -notcontains $chatId) { $State.subscribers += $chatId }
+            if ($State.subscribers -notcontains $chatId) {
+                $isFirstSubscriber = $State.subscribers.Count -eq 0
+                $State.subscribers += $chatId
+                if ($isFirstSubscriber) { $State.sent_urls = @(); $State.initialized = $false }
+            }
             Invoke-Telegram 'sendMessage' @{ chat_id = $chatId; text = 'Готово. Буду присылать новые новости Крымэнерго с графиками и сообщениями об отключениях.' } $Config | Out-Null
         }
     }
