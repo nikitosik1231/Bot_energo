@@ -1,0 +1,53 @@
+name: Crimea Energy news monitor
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crimea-energy-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create private configuration
+        shell: pwsh
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          $config = @{
+            telegram_bot_token = $env:TELEGRAM_BOT_TOKEN
+            news_url = 'https://crimea-energy.ru/about/news'
+            send_existing_on_first_run = $true
+          }
+          $config | ConvertTo-Json | Set-Content config.json -Encoding utf8
+
+      - name: Check news and send updates
+        shell: pwsh
+        run: pwsh -NoProfile -File monitor.ps1
+
+      - name: Save processing history
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f state.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Update bot state"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push; then exit 0; fi
+            git rebase --abort || true
+            sleep 2
+          done
+          exit 1
