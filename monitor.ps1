@@ -15,7 +15,11 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 }
 
 $DefaultNewsUrl = 'https://crimea-energy.ru/about/news'
-$RetryDelaySeconds = 15
+
+# Один запрос может ждать сайт до 90 секунд.
+# Если сайт временно недоступен, статья будет запрашиваться снова.
+$RequestTimeoutSeconds = 90
+$RetryDelaySeconds = 10
 
 $RelevantKeywords = @(
     'график',
@@ -31,16 +35,32 @@ $RelevantKeywords = @(
 )
 
 function Read-JsonFile {
-    param([string]$Path, $Default)
-    if (-not (Test-Path -LiteralPath $Path)) { return $Default }
-    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    if ([string]::IsNullOrWhiteSpace($raw)) { return $Default }
-    return ($raw | ConvertFrom-Json)
+    param(
+        [string]$Path,
+        $Default
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $Default
+    }
+
+    $Raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+
+    if ([string]::IsNullOrWhiteSpace($Raw)) {
+        return $Default
+    }
+
+    return ($Raw | ConvertFrom-Json)
 }
 
 function Save-JsonFile {
-    param($Object, [string]$Path)
-    $Object | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Path -Encoding UTF8
+    param(
+        $Object,
+        [string]$Path
+    )
+
+    $Object | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
 function Ensure-StateProperties {
@@ -49,15 +69,19 @@ function Ensure-StateProperties {
     if ($null -eq $State.known_urls) {
         $State | Add-Member -NotePropertyName known_urls -NotePropertyValue @()
     }
+
     if ($null -eq $State.sent_urls) {
         $State | Add-Member -NotePropertyName sent_urls -NotePropertyValue @()
     }
+
     if ($null -eq $State.subscribers) {
         $State | Add-Member -NotePropertyName subscribers -NotePropertyValue @()
     }
+
     if ($null -eq $State.initialized) {
         $State | Add-Member -NotePropertyName initialized -NotePropertyValue $false
     }
+
     if ($null -eq $State.telegram_update_offset) {
         $State | Add-Member -NotePropertyName telegram_update_offset -NotePropertyValue 0
     }
@@ -66,152 +90,290 @@ function Ensure-StateProperties {
 }
 
 function Get-Page {
-    param([Parameter(Mandatory = $true)][string]$Url)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
 
-    $headers = @{
-        'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
-        'Accept'          = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        'Accept-Language' = 'ru-RU,ru;q=0.9'
-        'Cache-Control'   = 'no-cache'
-        'Pragma'          = 'no-cache'
+    $Headers = @{
+        'User-Agent' =
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
+        'Accept' =
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        'Accept-Language' =
+            'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+        'Cache-Control' = 'no-cache'
+        'Pragma' = 'no-cache'
     }
 
-    Write-Host "HTTP GET: $Url"
+    Write-Host ('HTTP GET: {0}' -f $Url)
 
-    $response = Invoke-WebRequest `
+    $Response = Invoke-WebRequest `
         -Uri $Url `
-        -Headers $headers `
+        -Headers $Headers `
         -MaximumRedirection 10 `
-        -TimeoutSec 90 `
+        -TimeoutSec $RequestTimeoutSeconds `
         -UseBasicParsing `
         -ErrorAction Stop
 
-    if ([string]::IsNullOrWhiteSpace($response.Content)) {
+    if ([string]::IsNullOrWhiteSpace($Response.Content)) {
         throw 'Сайт вернул пустой ответ.'
     }
 
-    Write-Host "HTTP status: $($response.StatusCode)"
-    Write-Host "Downloaded bytes: $($response.RawContentLength)"
+    Write-Host ('HTTP status: {0}' -f $Response.StatusCode)
 
-    return $response.Content
+    if ($null -ne $Response.RawContentLength) {
+        Write-Host ('Downloaded bytes: {0}' -f $Response.RawContentLength)
+    }
+
+    return $Response.Content
 }
 
 function Get-PageUntilSuccess {
-    param([Parameter(Mandatory = $true)][string]$Url)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
 
-    $attempt = 0
+    $Attempt = 0
 
     while ($true) {
-        $attempt++
+        $Attempt++
 
         try {
-            Write-Host "Attempt #$attempt: $Url"
-            return Get-Page $Url
+            Write-Host ('Attempt #{0}: {1}' -f $Attempt, $Url)
+            return Get-Page -Url $Url
         }
         catch {
-            Write-Warning "Attempt #$attempt failed: $($_.Exception.Message)"
-            Write-Host "Повтор через $RetryDelaySeconds сек."
+            $ErrorText = $_.Exception.Message
+
+            Write-Warning (
+                'Attempt #{0} failed: {1}' -f
+                $Attempt,
+                $ErrorText
+            )
+
+            Write-Host (
+                'Повтор через {0} сек.' -f
+                $RetryDelaySeconds
+            )
+
             Start-Sleep -Seconds $RetryDelaySeconds
         }
     }
 }
 
 function To-AbsoluteUrl {
-    param([string]$Href, [uri]$BaseUri)
+    param(
+        [string]$Href,
+        [uri]$BaseUri
+    )
 
-    if ([string]::IsNullOrWhiteSpace($Href)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Href)) {
+        return $null
+    }
 
-    $Href = [System.Net.WebUtility]::HtmlDecode($Href).Trim()
+    $CleanHref = [System.Net.WebUtility]::HtmlDecode($Href).Trim()
 
     try {
-        $uri = [uri]::new($BaseUri, $Href)
-        if ($uri.Scheme -notin @('http', 'https')) { return $null }
-        return $uri.AbsoluteUri
+        $Uri = [uri]::new($BaseUri, $CleanHref)
+
+        if ($Uri.Scheme -notin @('http', 'https')) {
+            return $null
+        }
+
+        return $Uri.AbsoluteUri
     }
     catch {
         return $null
     }
 }
 
-function Convert-HtmlToText {
-    param([string]$Html)
+function Normalize-ArticleUrl {
+    param(
+        [string]$Url
+    )
 
-    if ([string]::IsNullOrWhiteSpace($Html)) { return '' }
+    try {
+        $Uri = [uri]$Url
 
-    $text = $Html
-    $text = [regex]::Replace($text, '<br\s*/?>', "`n", 'IgnoreCase')
-    $text = [regex]::Replace($text, '</p\s*>', "`n", 'IgnoreCase')
-    $text = [regex]::Replace($text, '</div\s*>', "`n", 'IgnoreCase')
-    $text = [regex]::Replace($text, '</li\s*>', "`n", 'IgnoreCase')
-    $text = [regex]::Replace($text, '<script\b[^>]*>.*?</script>', '', 'IgnoreCase,Singleline')
-    $text = [regex]::Replace($text, '<style\b[^>]*>.*?</style>', '', 'IgnoreCase,Singleline')
-    $text = $text -replace '<[^>]+>', ' '
-    $text = [System.Net.WebUtility]::HtmlDecode($text)
-    $text = [regex]::Replace($text, '[ \t]+', ' ')
-    $text = [regex]::Replace($text, ' *\n *', "`n")
-    return $text.Trim()
+        if ($Uri.Scheme -notin @('http', 'https')) {
+            return $null
+        }
+
+        return $Uri.GetLeftPart([System.UriPartial]::Path).TrimEnd('/')
+    }
+    catch {
+        return $null
+    }
 }
 
 function Test-ArticleUrl {
-    param([string]$Url)
+    param(
+        [string]$Url
+    )
 
     try {
-        $uri = [uri]$Url
-        return $uri.AbsolutePath -match '^/about/news/[^/]+$'
+        $Uri = [uri]$Url
+
+        return (
+            $Uri.AbsolutePath -match '^/about/news/[^/]+$'
+        )
     }
     catch {
         return $false
     }
 }
 
-function Get-ArticleLinks {
-    param([string]$Html, [uri]$BaseUri)
+function Convert-HtmlToText {
+    param(
+        [string]$Html
+    )
 
-    $result = @()
-    $seen = [System.Collections.Generic.HashSet[string]]::new(
+    if ([string]::IsNullOrWhiteSpace($Html)) {
+        return ''
+    }
+
+    $Text = $Html
+
+    $Text = [regex]::Replace(
+        $Text,
+        '<br\s*/?>',
+        "`n",
+        'IgnoreCase'
+    )
+
+    $Text = [regex]::Replace(
+        $Text,
+        '</p\s*>',
+        "`n",
+        'IgnoreCase'
+    )
+
+    $Text = [regex]::Replace(
+        $Text,
+        '</div\s*>',
+        "`n",
+        'IgnoreCase'
+    )
+
+    $Text = [regex]::Replace(
+        $Text,
+        '</li\s*>',
+        "`n",
+        'IgnoreCase'
+    )
+
+    $Text = [regex]::Replace(
+        $Text,
+        '<script\b[^>]*>.*?</script>',
+        '',
+        'IgnoreCase,Singleline'
+    )
+
+    $Text = [regex]::Replace(
+        $Text,
+        '<style\b[^>]*>.*?</style>',
+        '',
+        'IgnoreCase,Singleline'
+    )
+
+    $Text = $Text -replace '<[^>]+>', ' '
+    $Text = [System.Net.WebUtility]::HtmlDecode($Text)
+
+    $Text = [regex]::Replace(
+        $Text,
+        '[ \t]+',
+        ' '
+    )
+
+    $Text = [regex]::Replace(
+        $Text,
+        ' *\n *',
+        "`n"
+    )
+
+    return $Text.Trim()
+}
+
+function Get-ArticleLinks {
+    param(
+        [string]$Html,
+        [uri]$BaseUri
+    )
+
+    $Result = @()
+
+    $Seen = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
     )
 
-    $pattern = '<a\b[^>]*href\s*=\s*["''](?<href>[^"'']+)["''][^>]*>(?<text>.*?)</a>'
-    $matches = [regex]::Matches($Html, $pattern, 'IgnoreCase,Singleline')
+    $Pattern =
+        '<a\b[^>]*href\s*=\s*["''](?<href>[^"'']+)["''][^>]*>(?<text>.*?)</a>'
 
-    foreach ($match in $matches) {
-        $url = To-AbsoluteUrl $match.Groups['href'].Value $BaseUri
-        if (-not $url) { continue }
-        if (-not (Test-ArticleUrl $url)) { continue }
+    $Matches = [regex]::Matches(
+        $Html,
+        $Pattern,
+        'IgnoreCase,Singleline'
+    )
 
-        try {
-            $uri = [uri]$url
-            $url = $uri.GetLeftPart([System.UriPartial]::Path)
+    foreach ($Match in $Matches) {
+        $Url = To-AbsoluteUrl `
+            -Href $Match.Groups['href'].Value `
+            -BaseUri $BaseUri
+
+        if (-not $Url) {
+            continue
         }
-        catch { }
 
-        if ($seen.Add($url)) {
-            $result += [pscustomobject]@{
-                Url = $url
-                Title = Convert-HtmlToText $match.Groups['text'].Value
+        if (-not (Test-ArticleUrl -Url $Url)) {
+            continue
+        }
+
+        $Url = Normalize-ArticleUrl -Url $Url
+
+        if (-not $Url) {
+            continue
+        }
+
+        if ($Seen.Add($Url)) {
+            $Title = Convert-HtmlToText `
+                -Html $Match.Groups['text'].Value
+
+            $Result += [pscustomobject]@{
+                Url = $Url
+                Title = $Title
             }
         }
     }
 
-    return @($result)
+    return @($Result)
 }
 
 function Get-ArticleTitle {
-    param([string]$Html)
-
-    $patterns = @(
-        '<h1[^>]*>(?<value>.*?)</h1>',
-        '<h2[^>]*itemprop\s*=\s*["'']headline["''][^>]*>(?<value>.*?)</h2>',
-        '<title[^>]*>(?<value>.*?)</title>'
+    param(
+        [string]$Html
     )
 
-    foreach ($pattern in $patterns) {
-        $match = [regex]::Match($Html, $pattern, 'IgnoreCase,Singleline')
-        if ($match.Success) {
-            $title = Convert-HtmlToText $match.Groups['value'].Value
-            if ($title -and $title -ne 'Новости') {
-                return $title
+    $Patterns = @(
+        '<h2\b[^>]*itemprop\s*=\s*["'']headline["''][^>]*>(?<value>.*?)</h2>',
+        '<h1\b[^>]*>(?<value>.*?)</h1>',
+        '<title\b[^>]*>(?<value>.*?)</title>'
+    )
+
+    foreach ($Pattern in $Patterns) {
+        $Match = [regex]::Match(
+            $Html,
+            $Pattern,
+            'IgnoreCase,Singleline'
+        )
+
+        if ($Match.Success) {
+            $Title = Convert-HtmlToText `
+                -Html $Match.Groups['value'].Value
+
+            if ($Title) {
+                return $Title
             }
         }
     }
@@ -219,220 +381,345 @@ function Get-ArticleTitle {
     return 'Новости'
 }
 
-function Get-ArticleBody {
-    param([string]$Html)
-
-    $patterns = @(
-        '<div[^>]*itemprop\s*=\s*["'']articleBody["''][^>]*>(?<value>.*?)</div>',
-        '<article[^>]*>(?<value>.*?)</article>'
+function Get-ArticleBodyHtml {
+    param(
+        [string]$Html
     )
 
-    foreach ($pattern in $patterns) {
-        $match = [regex]::Match($Html, $pattern, 'IgnoreCase,Singleline')
-        if ($match.Success -and $match.Groups['value'].Value) {
-            return $match.Groups['value'].Value
+    $Patterns = @(
+        '<div\b[^>]*itemprop\s*=\s*["'']articleBody["''][^>]*>(?<value>.*?)</div>',
+        '<article\b[^>]*>(?<value>.*?)</article>'
+    )
+
+    foreach ($Pattern in $Patterns) {
+        $Match = [regex]::Match(
+            $Html,
+            $Pattern,
+            'IgnoreCase,Singleline'
+        )
+
+        if ($Match.Success -and $Match.Groups['value'].Value) {
+            return $Match.Groups['value'].Value
         }
     }
 
-    $bodyMatch = [regex]::Match($Html, '<body[^>]*>(?<value>.*?)</body>', 'IgnoreCase,Singleline')
-    if ($bodyMatch.Success) { return $bodyMatch.Groups['value'].Value }
+    $BodyMatch = [regex]::Match(
+        $Html,
+        '<body\b[^>]*>(?<value>.*?)</body>',
+        'IgnoreCase,Singleline'
+    )
+
+    if ($BodyMatch.Success) {
+        return $BodyMatch.Groups['value'].Value
+    }
 
     return $Html
 }
 
 function Get-DetailLines {
-    param([string]$BodyHtml)
+    param(
+        [string]$BodyHtml
+    )
 
-    $plain = $BodyHtml
-    $plain = [regex]::Replace($plain, '<br\s*/?>', "`n", 'IgnoreCase')
-    $plain = [regex]::Replace($plain, '</p\s*>', "`n", 'IgnoreCase')
-    $plain = [regex]::Replace($plain, '</div\s*>', "`n", 'IgnoreCase')
-    $plain = [regex]::Replace($plain, '</li\s*>', "`n", 'IgnoreCase')
-    $plain = Convert-HtmlToText $plain
+    $WithBreaks = $BodyHtml
 
-    $result = @()
+    $WithBreaks = [regex]::Replace(
+        $WithBreaks,
+        '<br\s*/?>',
+        "`n",
+        'IgnoreCase'
+    )
 
-    foreach ($raw in ($plain -split "`r`n|`n|`r")) {
-        $line = ($raw -replace '\s+', ' ').Trim()
-        if (-not $line) { continue }
+    $WithBreaks = [regex]::Replace(
+        $WithBreaks,
+        '</p\s*>',
+        "`n",
+        'IgnoreCase'
+    )
 
-        $isArea =
-            $line -match '^г\.\s*' -or
-            $line -match '^город\s+' -or
-            $line -match 'район(?:а)?$' -or
-            $line -match 'округ(?:а)?$' -or
-            $line -match '^с\.\s*' -or
-            $line -match '^пгт\.\s*'
+    $WithBreaks = [regex]::Replace(
+        $WithBreaks,
+        '</div\s*>',
+        "`n",
+        'IgnoreCase'
+    )
 
-        $result += [pscustomobject]@{
-            Text   = $line.Trim(' ', ',', ':', ';')
-            IsArea = $isArea
+    $WithBreaks = [regex]::Replace(
+        $WithBreaks,
+        '</li\s*>',
+        "`n",
+        'IgnoreCase'
+    )
+
+    $Plain = Convert-HtmlToText -Html $WithBreaks
+    $Result = @()
+
+    foreach ($Raw in ($Plain -split "`r`n|`n|`r")) {
+        $Line = ($Raw -replace '\s+', ' ').Trim()
+
+        if (-not $Line) {
+            continue
+        }
+
+        $IsArea = (
+            ($Line -match '^г\.\s*') -or
+            ($Line -match '^город\s+') -or
+            ($Line -match '^с\.\s*') -or
+            ($Line -match '^пгт\.\s*') -or
+            ($Line -match 'район(?:а)?$') -or
+            ($Line -match 'округ(?:а)?$')
+        )
+
+        $Result += [pscustomobject]@{
+            Text = $Line.Trim(' ', ',', ':', ';')
+            IsArea = $IsArea
         }
     }
 
-    return @($result)
+    return @($Result)
 }
 
 function Get-Article {
-    param([string]$Url)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
 
-    $html = Get-PageUntilSuccess $Url
-    $title = Get-ArticleTitle $html
-    $bodyHtml = Get-ArticleBody $html
-    $text = Convert-HtmlToText $bodyHtml
+    $Html = Get-PageUntilSuccess -Url $Url
 
-    $dateMatch = [regex]::Match(
-        $text,
+    $Title = Get-ArticleTitle -Html $Html
+    $BodyHtml = Get-ArticleBodyHtml -Html $Html
+    $Text = Convert-HtmlToText -Html $BodyHtml
+
+    $DateMatch = [regex]::Match(
+        $Text,
         '\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\b',
         'IgnoreCase'
     )
 
-    $date = if ($dateMatch.Success) { $dateMatch.Value } else { '' }
+    $Date = ''
 
-    $times = @(
-        [regex]::Matches($text, '\b\d{1,2}:\d{2}\b') |
-        ForEach-Object { $_.Value } |
+    if ($DateMatch.Success) {
+        $Date = $DateMatch.Value
+    }
+
+    $Times = @(
+        [regex]::Matches(
+            $Text,
+            '\b\d{1,2}:\d{2}\b'
+        ) |
+        ForEach-Object {
+            $_.Value
+        } |
         Select-Object -Unique
     )
 
-    $time = $times -join '–'
+    $Time = $Times -join ', '
 
-    $areaMatch = [regex]::Match(
-        $text,
-        '(?:г\.|город|с\.|пгт\.|район|округ)\s*[^,.;\n]{1,100}',
+    $AreaMatch = [regex]::Match(
+        $Text,
+        '(?:г\.|город|с\.|пгт\.|район|округ)\s*[^,.;\n]{1,120}',
         'IgnoreCase'
     )
 
-    $area = if ($areaMatch.Success) { $areaMatch.Value.Trim() } else { '' }
+    $Area = ''
+
+    if ($AreaMatch.Success) {
+        $Area = $AreaMatch.Value.Trim()
+    }
+
+    $DetailLines = Get-DetailLines -BodyHtml $BodyHtml
 
     return [pscustomobject]@{
-        Url         = $Url
-        Title       = $title
-        Text        = $text
-        Date        = $date
-        Time        = $time
-        Area        = $area
-        DetailLines = @(Get-DetailLines $bodyHtml)
+        Url = $Url
+        Title = $Title
+        Text = $Text
+        Date = $Date
+        Time = $Time
+        Area = $Area
+        DetailLines = $DetailLines
     }
 }
 
-function Invoke-Telegram {
-    param([string]$Method, $Payload, $Config)
+function Test-ArticleRelevant {
+    param(
+        [pscustomobject]$Article
+    )
 
-    $token = [string]$Config.telegram_bot_token
-    if ([string]::IsNullOrWhiteSpace($token)) {
+    $Haystack = (
+        ($Article.Title + ' ' + $Article.Text)
+    ).ToLowerInvariant()
+
+    foreach ($Keyword in $RelevantKeywords) {
+        if ($Haystack.Contains(
+            $Keyword.ToLowerInvariant()
+        )) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Invoke-Telegram {
+    param(
+        [string]$Method,
+        $Payload,
+        $Config
+    )
+
+    $Token = [string]$Config.telegram_bot_token
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
         throw 'telegram_bot_token не указан.'
     }
 
-    $json = $Payload | ConvertTo-Json -Compress -Depth 10
-    $uri = "https://api.telegram.org/bot$token/$Method"
+    $Json = $Payload |
+        ConvertTo-Json -Compress -Depth 10
+
+    $Uri = 'https://api.telegram.org/bot{0}/{1}' -f `
+        $Token,
+        $Method
 
     return Invoke-RestMethod `
         -Method Post `
-        -Uri $uri `
+        -Uri $Uri `
         -ContentType 'application/json; charset=utf-8' `
-        -Body $json `
+        -Body $Json `
         -TimeoutSec 60 `
         -ErrorAction Stop
 }
 
 function Receive-Subscribers {
-    param($Config, $State)
+    param(
+        $Config,
+        $State
+    )
 
     try {
-        $response = Invoke-Telegram `
-            'getUpdates' `
-            @{
+        $Response = Invoke-Telegram `
+            -Method 'getUpdates' `
+            -Payload @{
                 offset = [long]$State.telegram_update_offset
                 timeout = 0
-                allowed_updates = @('message','channel_post','my_chat_member')
+                allowed_updates = @(
+                    'message',
+                    'channel_post',
+                    'my_chat_member'
+                )
             } `
-            $Config
+            -Config $Config
 
-        foreach ($update in @($response.result)) {
-            $State.telegram_update_offset = [long]$update.update_id + 1
+        foreach ($Update in @($Response.result)) {
+            $State.telegram_update_offset =
+                [long]$Update.update_id + 1
 
-            if ($update.message) {
-                $chatId = [long]$update.message.chat.id
-                $text = [string]$update.message.text
+            if ($Update.message) {
+                $ChatId = [long]$Update.message.chat.id
+                $Text = [string]$Update.message.text
 
-                if ($text -match '^/start(?:\s|$)') {
-                    if ($State.subscribers -notcontains $chatId) {
-                        $State.subscribers += $chatId
+                if ($Text -match '^/start(?:\s|$)') {
+                    if ($State.subscribers -notcontains $ChatId) {
+                        $State.subscribers += $ChatId
                     }
 
                     Invoke-Telegram `
-                        'sendMessage' `
-                        @{
-                            chat_id = $chatId
-                            text = 'Готово. Буду присылать новые публикации Крымэнерго об отключениях.'
+                        -Method 'sendMessage' `
+                        -Payload @{
+                            chat_id = $ChatId
+                            text = 'Готово. Буду присылать новые новости Крымэнерго с сообщениями об отключениях.'
                         } `
-                        $Config |
+                        -Config $Config |
                         Out-Null
                 }
 
-                if ($text -match '^/stop(?:\s|$)') {
+                if ($Text -match '^/stop(?:\s|$)') {
                     $State.subscribers = @(
                         $State.subscribers |
-                        Where-Object { $_ -ne $chatId }
+                        Where-Object {
+                            $_ -ne $ChatId
+                        }
                     )
 
                     Invoke-Telegram `
-                        'sendMessage' `
-                        @{
-                            chat_id = $chatId
+                        -Method 'sendMessage' `
+                        -Payload @{
+                            chat_id = $ChatId
                             text = 'Уведомления отключены.'
                         } `
-                        $Config |
+                        -Config $Config |
                         Out-Null
                 }
             }
 
-            if ($update.channel_post) {
-                $chatId = [long]$update.channel_post.chat.id
-                if ($State.subscribers -notcontains $chatId) {
-                    $State.subscribers += $chatId
+            if ($Update.channel_post) {
+                $ChatId = [long]$Update.channel_post.chat.id
+
+                if ($State.subscribers -notcontains $ChatId) {
+                    $State.subscribers += $ChatId
                 }
             }
 
-            if ($update.my_chat_member) {
-                $member = $update.my_chat_member
+            if ($Update.my_chat_member) {
+                $Member = $Update.my_chat_member
 
                 if (
-                    $member.chat.type -in @('channel','group','supergroup') -and
-                    $member.new_chat_member.status -in @('member','administrator')
+                    $Member.chat.type -in @(
+                        'channel',
+                        'group',
+                        'supergroup'
+                    ) -and
+                    $Member.new_chat_member.status -in @(
+                        'member',
+                        'administrator'
+                    )
                 ) {
-                    $chatId = [long]$member.chat.id
-                    if ($State.subscribers -notcontains $chatId) {
-                        $State.subscribers += $chatId
+                    $ChatId = [long]$Member.chat.id
+
+                    if ($State.subscribers -notcontains $ChatId) {
+                        $State.subscribers += $ChatId
                     }
                 }
             }
         }
     }
     catch {
-        Write-Warning "Telegram getUpdates: $($_.Exception.Message)"
+        Write-Warning (
+            'Telegram getUpdates error: {0}' -f
+            $_.Exception.Message
+        )
     }
 }
 
 function Split-TelegramLine {
-    param([string]$Line)
+    param(
+        [string]$Line
+    )
 
-    if ($Line.Length -le 3600) { return @($Line) }
-
-    $parts = @()
-    $remaining = $Line
-
-    while ($remaining.Length -gt 3600) {
-        $cut = $remaining.LastIndexOf(' ', 3600)
-        if ($cut -lt 1) { $cut = 3600 }
-
-        $parts += $remaining.Substring(0, $cut)
-        $remaining = $remaining.Substring($cut).TrimStart()
+    if ($Line.Length -le 3600) {
+        return @($Line)
     }
 
-    if ($remaining) { $parts += $remaining }
-    return @($parts)
+    $Parts = @()
+    $Remaining = $Line
+
+    while ($Remaining.Length -gt 3600) {
+        $Cut = $Remaining.LastIndexOf(' ', 3600)
+
+        if ($Cut -lt 1) {
+            $Cut = 3600
+        }
+
+        $Parts += $Remaining.Substring(0, $Cut)
+        $Remaining =
+            $Remaining.Substring($Cut).TrimStart()
+    }
+
+    if ($Remaining) {
+        $Parts += $Remaining
+    }
+
+    return @($Parts)
 }
 
 function Send-TelegramLines {
@@ -442,47 +729,54 @@ function Send-TelegramLines {
         [long[]]$ChatIds
     )
 
-    $messages = @()
-    $current = ''
+    $Messages = @()
+    $Current = ''
 
-    foreach ($sourceLine in $Lines) {
-        foreach ($line in (Split-TelegramLine $sourceLine)) {
-            $candidate = if ($current) {
-                $current + "`n" + $line
+    foreach ($SourceLine in $Lines) {
+        foreach ($Line in (
+            Split-TelegramLine -Line $SourceLine
+        )) {
+            if ($Current) {
+                $Candidate = $Current + "`n" + $Line
             }
             else {
-                $line
+                $Candidate = $Line
             }
 
-            if ($candidate.Length -gt 3800 -and $current) {
-                $messages += $current
-                $current = "📄 <b>Продолжение</b>`n$line"
+            if (
+                ($Candidate.Length -gt 3800) -and
+                $Current
+            ) {
+                $Messages += $Current
+                $Current =
+                    "📄 <b>Продолжение</b>`n" + $Line
             }
             else {
-                $current = $candidate
+                $Current = $Candidate
             }
         }
     }
 
-    if ($current) { $messages += $current }
+    if ($Current) {
+        $Messages += $Current
+    }
 
-    foreach ($message in $messages) {
-        foreach ($chatId in $ChatIds) {
+    foreach ($Message in $Messages) {
+        foreach ($ChatId in $ChatIds) {
             Invoke-Telegram `
-                'sendMessage' `
-                @{
-                    chat_id = $chatId
-                    text = $message
+                -Method 'sendMessage' `
+                -Payload @{
+                    chat_id = $ChatId
+                    text = $Message
                     parse_mode = 'HTML'
                     disable_web_page_preview = $false
                 } `
-                $Config |
+                -Config $Config |
                 Out-Null
         }
     }
 }
 
-# Старое оформление пользователя.
 function Send-Telegram {
     param(
         [pscustomobject]$Article,
@@ -490,293 +784,444 @@ function Send-Telegram {
         [long[]]$ChatIds
     )
 
-    $lines = @(
+    # Это оформление оставлено в том же формате:
+    # заголовок -> дата -> время -> территории -> ссылка.
+    $Lines = @(
         '⚡ <b>Крымэнерго — отключения</b>',
         '',
-        ('<b>📌 {0}</b>' -f
-            [System.Net.WebUtility]::HtmlEncode($Article.Title))
+        (
+            '<b>📌 {0}</b>' -f
+            [System.Net.WebUtility]::HtmlEncode(
+                $Article.Title
+            )
+        )
     )
 
     if ($Article.Date) {
-        $lines += (
+        $Lines += (
             '📅 <b>Дата:</b> {0}' -f
-            [System.Net.WebUtility]::HtmlEncode($Article.Date)
+            [System.Net.WebUtility]::HtmlEncode(
+                $Article.Date
+            )
         )
     }
 
     if ($Article.Time) {
-        $lines += (
+        $Lines += (
             '⏰ <b>Время:</b> {0}' -f
-            [System.Net.WebUtility]::HtmlEncode($Article.Time)
+            [System.Net.WebUtility]::HtmlEncode(
+                $Article.Time
+            )
         )
     }
 
-    $lines += @('', '📝 <b>Детали по территориям:</b>')
+    $Lines += @(
+        '',
+        '📝 <b>Детали по территориям:</b>'
+    )
 
-    foreach ($detail in $Article.DetailLines) {
-        $encoded = [System.Net.WebUtility]::HtmlEncode($detail.Text)
+    foreach ($Detail in $Article.DetailLines) {
+        $Encoded = [System.Net.WebUtility]::HtmlEncode(
+            $Detail.Text
+        )
 
-        if ($detail.IsArea) {
-            $lines += "📍 <b>$encoded</b>"
+        if ($Detail.IsArea) {
+            $Lines += (
+                '📍 <b>' + $Encoded + '</b>'
+            )
         }
         else {
-            $lines += "▫️ $encoded"
+            $Lines += (
+                '▫️ ' + $Encoded
+            )
         }
     }
 
-    $lines += @(
+    $Lines += @(
         '',
-        ('🔗 <a href="{0}">Открыть публикацию</a>' -f
-            [System.Net.WebUtility]::HtmlEncode($Article.Url))
+        (
+            '🔗 <a href="{0}">Открыть публикацию</a>' -f
+            [System.Net.WebUtility]::HtmlEncode(
+                $Article.Url
+            )
+        )
     )
 
-    Send-TelegramLines $lines $Config $ChatIds
+    Send-TelegramLines `
+        -Lines $Lines `
+        -Config $Config `
+        -ChatIds $ChatIds
 }
 
 # ============================================================
-# MAIN
+# START
 # ============================================================
 
 Write-Host ''
 Write-Host '========================================'
 Write-Host ' Crimea Energy Telegram Monitor'
 Write-Host '========================================'
+Write-Host ''
 
-$config = Read-JsonFile $ConfigPath $null
-if (-not $config) {
-    throw "Не найден config.json: $ConfigPath"
+$Config = Read-JsonFile `
+    -Path $ConfigPath `
+    -Default $null
+
+if (-not $Config) {
+    throw (
+        'Не найден config.json: {0}' -f
+        $ConfigPath
+    )
 }
 
-if ([string]::IsNullOrWhiteSpace([string]$config.telegram_bot_token)) {
+if (
+    [string]::IsNullOrWhiteSpace(
+        [string]$Config.telegram_bot_token
+    )
+) {
     throw 'В config.json отсутствует telegram_bot_token.'
 }
 
-$statePath = Join-Path $ScriptDirectory 'state.json'
+$StatePath = Join-Path `
+    $ScriptDirectory `
+    'state.json'
 
-$state = Read-JsonFile `
-    $statePath `
-    ([pscustomobject]@{
-        known_urls = @()
-        sent_urls = @()
-        initialized = $false
-        subscribers = @()
-        telegram_update_offset = 0
-    })
+$State = Read-JsonFile `
+    -Path $StatePath `
+    -Default (
+        [pscustomobject]@{
+            known_urls = @()
+            sent_urls = @()
+            initialized = $false
+            subscribers = @()
+            telegram_update_offset = 0
+        }
+    )
 
-$state = Ensure-StateProperties $state
+$State = Ensure-StateProperties -State $State
 
-Receive-Subscribers $config $state
-Save-JsonFile $state $statePath
+Receive-Subscribers `
+    -Config $Config `
+    -State $State
 
-Write-Host "Telegram subscribers: $($state.subscribers.Count)"
+Save-JsonFile `
+    -Object $State `
+    -Path $StatePath
 
-$newsUrl = [string]$config.news_url
-if ([string]::IsNullOrWhiteSpace($newsUrl)) {
-    $newsUrl = $DefaultNewsUrl
+Write-Host (
+    'Telegram subscribers: {0}' -f
+    @($State.subscribers).Count
+)
+
+$NewsUrl = [string]$Config.news_url
+
+if ([string]::IsNullOrWhiteSpace($NewsUrl)) {
+    $NewsUrl = $DefaultNewsUrl
 }
 
-$newsUri = [uri]$newsUrl
-Write-Host "News URL: $newsUrl"
+$NewsUri = [uri]$NewsUrl
 
-# Страница новостей загружается один раз за запуск.
-$newsHtml = Get-PageUntilSuccess $newsUrl
-$links = @(Get-ArticleLinks $newsHtml $newsUri)
+Write-Host (
+    'Reading news: {0}' -f
+    $NewsUrl
+)
 
-Write-Host "Article links found: $($links.Count)"
+# ============================================================
+# Получаем саму страницу новостей.
+# Если сайт не отвечает — повторяем до успешного ответа.
+# ============================================================
 
-if ($links.Count -eq 0) {
-    Write-Warning 'На странице не найдено ссылок на статьи.'
-    Save-JsonFile $state $statePath
+$NewsHtml = Get-PageUntilSuccess -Url $NewsUrl
+
+$Links = @(Get-ArticleLinks `
+    -Html $NewsHtml `
+    -BaseUri $NewsUri)
+
+Write-Host (
+    'Article links found: {0}' -f
+    $Links.Count
+)
+
+if ($Links.Count -eq 0) {
+    Write-Warning (
+        'На странице {0} не найдено ссылок на статьи.' -f
+        $NewsUrl
+    )
+
+    Save-JsonFile `
+        -Object $State `
+        -Path $StatePath
+
     exit 0
 }
 
-$knownSet = [System.Collections.Generic.HashSet[string]]::new(
+# HashSet нужен только для быстрой проверки,
+# какие URL уже были обработаны.
+$KnownSet = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
 )
 
-foreach ($url in @($state.known_urls)) {
-    [void]$knownSet.Add([string]$url)
+foreach ($Url in @($State.known_urls)) {
+    if ($Url) {
+        [void]$KnownSet.Add([string]$Url)
+    }
 }
 
-$sentSet = [System.Collections.Generic.HashSet[string]]::new(
+$SentSet = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
 )
 
-foreach ($url in @($state.sent_urls)) {
-    [void]$sentSet.Add([string]$url)
+foreach ($Url in @($State.sent_urls)) {
+    if ($Url) {
+        [void]$SentSet.Add([string]$Url)
+    }
 }
 
 # ============================================================
-# FIRST RUN:
-# только 3 последние релевантные статьи.
+# ПЕРВЫЙ ЗАПУСК
 # ============================================================
 
-if (-not [bool]$state.initialized) {
+if (-not [bool]$State.initialized) {
 
     Write-Host ''
-    Write-Host 'FIRST RUN: ищем 3 последние релевантные публикации.'
+    Write-Host 'FIRST RUN'
+    Write-Host 'Ищем 3 последние релевантные публикации.'
 
-    $selected = @()
+    $Selected = @()
 
-    # Сайт отдаёт новости от новых к старым.
-    # Ищем три последние, открывая статьи последовательно.
-    foreach ($link in $links) {
+    # Страница Крымэнерго отдаёт новости от новых к старым.
+    # Идём сверху вниз и открываем каждую статью.
+    # Если статья не открылась — Get-PageUntilSuccess
+    # будет повторять запрос и НЕ даст перейти дальше.
+    foreach ($Link in $Links) {
 
-        if ($selected.Count -ge 3) { break }
+        if ($Selected.Count -ge 3) {
+            break
+        }
 
         Write-Host ''
-        Write-Host "Checking candidate: $($link.Url)"
+        Write-Host (
+            'Checking candidate: {0}' -f
+            $Link.Url
+        )
 
-        # Если статья не открывается, Get-PageUntilSuccess
-        # продолжает попытки до успешного получения.
-        $article = Get-Article $link.Url
+        $Article = Get-Article -Url $Link.Url
 
-        $haystack = "$($article.Title) $($article.Text)".ToLowerInvariant()
-        $isRelevant = $false
+        $IsRelevant = Test-ArticleRelevant `
+            -Article $Article
 
-        foreach ($keyword in $RelevantKeywords) {
-            if ($haystack.Contains($keyword.ToLowerInvariant())) {
-                $isRelevant = $true
-                break
-            }
-        }
+        Write-Host (
+            'Title: {0}' -f
+            $Article.Title
+        )
 
-        Write-Host "Title: $($article.Title)"
-        Write-Host "Relevant: $isRelevant"
+        Write-Host (
+            'Relevant: {0}' -f
+            $IsRelevant
+        )
 
-        [void]$knownSet.Add($link.Url)
+        [void]$KnownSet.Add($Link.Url)
 
-        if ($isRelevant) {
-            $selected += $article
+        if ($IsRelevant) {
+            $Selected += $Article
         }
     }
 
-    # Выбраны от новой к старой — отправляем от старой к новой.
-    [array]::Reverse($selected)
+    # Было: новая -> старая.
+    # Делаем: старая -> новая.
+    [array]::Reverse($Selected)
 
     Write-Host ''
-    Write-Host "FIRST RUN selected: $($selected.Count)"
+    Write-Host (
+        'FIRST RUN selected: {0}' -f
+        $Selected.Count
+    )
 
-    foreach ($article in $selected) {
+    foreach ($Article in $Selected) {
 
-        if ($sentSet.Contains($article.Url)) { continue }
+        if ($SentSet.Contains($Article.Url)) {
+            continue
+        }
 
-        if ($state.subscribers.Count -gt 0) {
+        if (@($State.subscribers).Count -gt 0) {
+
             Send-Telegram `
-                $article `
-                $config `
-                ([long[]]$state.subscribers)
+                -Article $Article `
+                -Config $Config `
+                -ChatIds ([long[]]@($State.subscribers))
 
-            Write-Host "Telegram: SENT - $($article.Title)"
+            Write-Host (
+                'Telegram: SENT - {0}' -f
+                $Article.Title
+            )
+
+            [void]$SentSet.Add($Article.Url)
         }
         else {
-            Write-Warning 'Нет подписчиков Telegram. Новость не отправлена.'
+            Write-Warning (
+                'Нет подписчиков Telegram. Не отправлена: {0}' -f
+                $Article.Title
+            )
         }
 
-        [void]$sentSet.Add($article.Url)
-        [void]$knownSet.Add($article.Url)
+        [void]$KnownSet.Add($Article.Url)
 
-        $state.known_urls = @($knownSet | Select-Object -Last 1000)
-        $state.sent_urls = @($sentSet | Select-Object -Last 500)
+        $State.known_urls = @(
+            $KnownSet |
+            Select-Object -Last 1000
+        )
 
-        # Сохраняем после каждой статьи.
-        Save-JsonFile $state $statePath
+        $State.sent_urls = @(
+            $SentSet |
+            Select-Object -Last 500
+        )
+
+        Save-JsonFile `
+            -Object $State `
+            -Path $StatePath
     }
 
-    # Все публикации, существовавшие на момент первого запуска,
-    # считаются известными, но отправляются только выбранные три.
-    foreach ($link in $links) {
-        [void]$knownSet.Add($link.Url)
+    # Всё, что было опубликовано на сайте до первого запуска,
+    # считаем уже просмотренным. Поэтому на следующем запуске
+    # старые статьи повторно не придут.
+    foreach ($Link in $Links) {
+        [void]$KnownSet.Add($Link.Url)
     }
 
-    $state.known_urls = @($knownSet | Select-Object -Last 1000)
-    $state.sent_urls = @($sentSet | Select-Object -Last 500)
-    $state.initialized = $true
+    $State.known_urls = @(
+        $KnownSet |
+        Select-Object -Last 1000
+    )
 
-    Save-JsonFile $state $statePath
+    $State.sent_urls = @(
+        $SentSet |
+        Select-Object -Last 500
+    )
 
+    $State.initialized = $true
+
+    Save-JsonFile `
+        -Object $State `
+        -Path $StatePath
+
+    Write-Host ''
     Write-Host 'FIRST RUN COMPLETE.'
     exit 0
 }
 
 # ============================================================
-# NORMAL RUN:
-# только URL, которых раньше не было.
+# ОБЫЧНЫЙ ЗАПУСК
 # ============================================================
 
 Write-Host ''
-Write-Host 'NORMAL RUN: ищем только новые публикации.'
+Write-Host 'NORMAL RUN'
+Write-Host 'Ищем только новые публикации.'
 
-$newLinks = @(
-    $links |
-    Where-Object { -not $knownSet.Contains($_.Url) }
+$NewLinks = @(
+    $Links |
+    Where-Object {
+        -not $KnownSet.Contains($_.Url)
+    }
 )
 
-Write-Host "New URLs: $($newLinks.Count)"
+Write-Host (
+    'New URLs: {0}' -f
+    $NewLinks.Count
+)
 
-if ($newLinks.Count -eq 0) {
-    foreach ($link in $links) {
-        [void]$knownSet.Add($link.Url)
+if ($NewLinks.Count -eq 0) {
+
+    # На всякий случай запоминаем все найденные URL.
+    foreach ($Link in $Links) {
+        [void]$KnownSet.Add($Link.Url)
     }
 
-    $state.known_urls = @($knownSet | Select-Object -Last 1000)
-    Save-JsonFile $state $statePath
+    $State.known_urls = @(
+        $KnownSet |
+        Select-Object -Last 1000
+    )
+
+    Save-JsonFile `
+        -Object $State `
+        -Path $StatePath
 
     Write-Host 'No new publications.'
     exit 0
 }
 
-# На сайте новые идут первыми. Публикуем старые новые -> новые новые.
-[array]::Reverse($newLinks)
+# На странице порядок: новая -> старая.
+# Обрабатываем: старая новая -> новая новая.
+[array]::Reverse($NewLinks)
 
-foreach ($link in $newLinks) {
+foreach ($Link in $NewLinks) {
 
     Write-Host ''
     Write-Host '----------------------------------------'
-    Write-Host "NEW ARTICLE: $($link.Url)"
+    Write-Host (
+        'NEW ARTICLE: {0}' -f
+        $Link.Url
+    )
 
-    # Не переходим к следующей статье, пока эту не получили.
-    $article = Get-Article $link.Url
+    # К следующей статье не переходим,
+    # пока текущая не будет успешно загружена.
+    $Article = Get-Article -Url $Link.Url
 
-    $haystack = "$($article.Title) $($article.Text)".ToLowerInvariant()
-    $isRelevant = $false
+    $IsRelevant = Test-ArticleRelevant `
+        -Article $Article
 
-    foreach ($keyword in $RelevantKeywords) {
-        if ($haystack.Contains($keyword.ToLowerInvariant())) {
-            $isRelevant = $true
-            break
-        }
-    }
+    Write-Host (
+        'Title: {0}' -f
+        $Article.Title
+    )
 
-    Write-Host "Title: $($article.Title)"
-    Write-Host "Relevant: $isRelevant"
+    Write-Host (
+        'Relevant: {0}' -f
+        $IsRelevant
+    )
 
-    if ($isRelevant) {
-        if ($state.subscribers.Count -gt 0) {
+    if ($IsRelevant) {
+
+        if (@($State.subscribers).Count -gt 0) {
+
             Send-Telegram `
-                $article `
-                $config `
-                ([long[]]$state.subscribers)
+                -Article $Article `
+                -Config $Config `
+                -ChatIds ([long[]]@($State.subscribers))
 
             Write-Host 'Telegram: SENT'
+
+            [void]$SentSet.Add($Link.Url)
         }
         else {
-            Write-Warning 'Нет подписчиков Telegram. Новость не отправлена.'
+            Write-Warning (
+                'Нет подписчиков Telegram. Не отправлена: {0}' -f
+                $Article.Title
+            )
         }
-
-        [void]$sentSet.Add($link.Url)
     }
     else {
         Write-Host 'Telegram: NOT SENT (not relevant)'
     }
 
-    [void]$knownSet.Add($link.Url)
+    # Независимо от релевантности статья теперь обработана.
+    [void]$KnownSet.Add($Link.Url)
 
-    $state.known_urls = @($knownSet | Select-Object -Last 1000)
-    $state.sent_urls = @($sentSet | Select-Object -Last 500)
+    $State.known_urls = @(
+        $KnownSet |
+        Select-Object -Last 1000
+    )
 
-    # Сохраняем после каждой обработанной публикации.
-    Save-JsonFile $state $statePath
+    $State.sent_urls = @(
+        $SentSet |
+        Select-Object -Last 500
+    )
+
+    # Сохраняем состояние после каждой статьи.
+    # Если GitHub оборвёт job после этого места,
+    # уже обработанные статьи не будут отправлены повторно.
+    Save-JsonFile `
+        -Object $State `
+        -Path $StatePath
 }
 
 Write-Host ''
