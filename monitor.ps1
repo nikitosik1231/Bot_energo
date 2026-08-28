@@ -77,12 +77,37 @@ function Get-RssLinks([string]$Url) {
     return $found
 }
 
-function Get-Article([string]$Url) {
-    $html = Get-Page $Url
-    $titleMatch = [regex]::Match($html, '<h2\b[^>]*itemprop\s*=\s*["'']headline["''][^>]*>(?<value>.*?)</h2>', 'IgnoreCase,Singleline')
-    $title = if ($titleMatch.Success) { [System.Net.WebUtility]::HtmlDecode(($titleMatch.Groups['value'].Value -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim()) } else { $Url }
-    $bodyMatch = [regex]::Match($html, '<div\b[^>]*itemprop\s*=\s*["'']articleBody["''][^>]*>(?<value>.*?)</div>', 'IgnoreCase,Singleline')
-    $bodyHtml = if ($bodyMatch.Success) { $bodyMatch.Groups['value'].Value } else { '' }
+function Get-RssArticles([string]$Url) {
+    [xml]$rss = Get-Page $Url
+    $result = @()
+    foreach ($item in @($rss.rss.channel.item)) {
+        $link = [string]$item.link
+        if (-not $link) { continue }
+        try {
+            $uri = [uri]$link
+            if ($uri.AbsolutePath -notmatch '^/about/news/[^/]+$') { continue }
+            $result += [pscustomobject]@{
+                Url = $uri.AbsoluteUri
+                Title = [System.Net.WebUtility]::HtmlDecode([string]$item.title).Trim()
+                BodyHtml = [string]$item.description
+            }
+        } catch { }
+    }
+    return $result
+}
+
+function Get-Article([string]$Url, [string]$RssTitle = '', [string]$RssBodyHtml = '') {
+    if ($RssBodyHtml) {
+        $html = $RssBodyHtml
+        $title = $RssTitle
+        $bodyHtml = $RssBodyHtml
+    } else {
+        $html = Get-Page $Url
+        $titleMatch = [regex]::Match($html, '<h2\b[^>]*itemprop\s*=\s*["'']headline["''][^>]*>(?<value>.*?)</h2>', 'IgnoreCase,Singleline')
+        $title = if ($titleMatch.Success) { [System.Net.WebUtility]::HtmlDecode(($titleMatch.Groups['value'].Value -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim()) } else { $Url }
+        $bodyMatch = [regex]::Match($html, '<div\b[^>]*itemprop\s*=\s*["'']articleBody["''][^>]*>(?<value>.*?)</div>', 'IgnoreCase,Singleline')
+        $bodyHtml = if ($bodyMatch.Success) { $bodyMatch.Groups['value'].Value } else { '' }
+    }
     $text = if ($bodyMatch.Success) { [System.Net.WebUtility]::HtmlDecode(($bodyHtml -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim()) } else { '' }
     $dateMatch = [regex]::Match($text, '\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\b', 'IgnoreCase')
     $date = if ($dateMatch.Success) { $dateMatch.Value } else { '' }
@@ -214,30 +239,34 @@ Write-Host "Telegram: subscribers = $($state.subscribers.Count)"
 
 $newsUrl = if ($config.news_url) { $config.news_url } else { 'https://crimea-energy.ru/about/news' }
 Write-Host "Reading news: $newsUrl"
+$rssUrl = "$newsUrl?format=feed&type=rss"
+$rssArticles = @()
 try {
-    $newsHtml = Get-Page $newsUrl
-    $links = Get-ArticleLinks $newsHtml ([uri]$newsUrl)
+    $rssArticles = Get-RssArticles $rssUrl
+    if ($rssArticles.Count -eq 0) { throw 'RSS contains no news items.' }
+    Write-Host "RSS articles found: $($rssArticles.Count)"
 } catch {
-    Write-Warning "Основная страница новостей недоступна: $($_.Exception.Message). Пробую RSS."
+    Write-Warning "RSS недоступен: $($_.Exception.Message). Пробую HTML-страницу."
     try {
-        $rssUrl = "$newsUrl?format=feed&type=rss"
-        $links = Get-RssLinks $rssUrl
-        Write-Host "RSS fallback: $rssUrl"
+        $newsHtml = Get-Page $newsUrl
+        $links = Get-ArticleLinks $newsHtml ([uri]$newsUrl)
+        $rssArticles = @($links | ForEach-Object { [pscustomobject]@{ Url = $_; Title = ''; BodyHtml = '' } })
+        Write-Host "HTML fallback: $($rssArticles.Count) links"
     } catch {
-        Write-Warning "RSS также недоступен: $($_.Exception.Message)"
+        Write-Warning "HTML-страница также недоступна: $($_.Exception.Message)"
         Save-State $state $statePath
         Write-Host 'Done. The source will be retried on the next run.'
         exit 0
     }
 }
-Write-Host "News links found: $($links.Count)"
 $keywords = @('график', 'отключен', 'обесточ', 'планов', 'электроснабжен', 'энергоснабжен', 'аварийн', 'восстановительн')
-$newUrls = @($links | Where-Object { $state.sent_urls -notcontains $_ } | Select-Object -First 3)
-[array]::Reverse($newUrls)
+$newArticles = @($rssArticles | Where-Object { $state.sent_urls -notcontains $_.Url } | Select-Object -First 3)
+[array]::Reverse($newArticles)
 
-foreach ($url in $newUrls) {
+foreach ($candidate in $newArticles) {
+    $url = $candidate.Url
     try {
-        $article = Get-Article $url
+        $article = Get-Article $url $candidate.Title $candidate.BodyHtml
         $haystack = "$($article.Title) $($article.Text)".ToLowerInvariant()
         $isRelevant = $false
         foreach ($keyword in $keywords) { if ($haystack.Contains($keyword)) { $isRelevant = $true; break } }
