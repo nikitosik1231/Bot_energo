@@ -105,7 +105,7 @@ function Get-PageUntilSuccess {
         $attempt++
 
         try {
-            Write-Host "Attempt #$attempt: $Url"
+            Write-Host "Attempt #${attempt}: $Url"
             return Get-Page $Url
         }
         catch {
