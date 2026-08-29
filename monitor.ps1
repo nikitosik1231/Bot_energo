@@ -461,8 +461,17 @@ function Get-DetailLines {
             continue
         }
 
-        $IsArea = (
-            ($Line -match '^г\.\s*') -or
+        $IsArea = $false
+        # Города и населённые пункты верхнего уровня
+        if ($Line -match '^(?:г\.|город)\s*[А-ЯЁ]') {
+            $IsArea = $true
+        }
+        if ($Line -match '^[А-ЯЁ][\p{L}\- ]+\s+район(?:а)?\s*[,;:]?$') {
+            $IsArea = $true
+        }
+        if ($Line -match '^[А-ЯЁ][\p{L}\- ]+\s+округ(?:а)?\s*[,;:]?$') {
+            $IsArea = $true
+        }
             ($Line -match '^город\s+') -or
             ($Line -match '^с\.\s*') -or
             ($Line -match '^пгт\.\s*') -or
@@ -503,18 +512,39 @@ function Get-Article {
         $Date = $DateMatch.Value
     }
 
-    $Times = @(
-        [regex]::Matches(
-            $Text,
-            '\b\d{1,2}:\d{2}\b'
-        ) |
-        ForEach-Object {
-            $_.Value
-        } |
-        Select-Object -Unique
-    )
+    $TimePeriods = @()
 
-    $Time = $Times -join ', '
+    $RangePattern = '(?i)(?:с\s*)?(\d{1,2}(?::\d{2})?)\s*(?:до|по|-|–|—)\s*(\d{1,2}(?::\d{2})?)'
+
+    foreach ($Match in [regex]::Matches($Text, $RangePattern)) {
+        $From = $Match.Groups[1].Value
+        $To = $Match.Groups[2].Value
+
+    if ($From -notmatch ':') {
+        $From = $From + ':00'
+    }
+
+    if ($To -notmatch ':') {
+        $To = $To + ':00'
+    }
+
+    $TimePeriods += "с $From до $To"
+    }
+
+    $TimePeriods = @($TimePeriods | Select-Object -Unique)
+
+    if ($TimePeriods.Count -gt 0) {
+        $Time = $TimePeriods -join ', '
+    }
+    else {
+        $SingleTimes = @(
+            [regex]::Matches($Text, '\b\d{1,2}:\d{2}\b') |
+            ForEach-Object { $_.Value } |
+            Select-Object -Unique
+         )
+
+        $Time = $SingleTimes -join ', '
+    }
 
     $AreaMatch = [regex]::Match(
         $Text,
