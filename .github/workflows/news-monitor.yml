@@ -2,7 +2,7 @@ name: Crimea Energy news monitor
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # <--- ЭТОТ ТРИГГЕР ОТСУТСТВУЕТ!
+    - cron: '17 * * * *'   # <--- ЭТОТ ТРИГГЕР ОТСУТСТВУЕТ!
   workflow_dispatch:
 
 permissions:
