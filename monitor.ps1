@@ -456,7 +456,7 @@ function Get-DetailLines {
 
     foreach ($Raw in ($Plain -split "`r`n|`n|`r")) {
         $Line = ($Raw -replace '\s+', ' ').Trim()
-
+        }
         if (-not $Line) {
             continue
         }
