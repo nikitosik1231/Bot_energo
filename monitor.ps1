@@ -420,7 +420,6 @@ function Get-DetailLines {
     param(
         [string]$BodyHtml
     )
-}
 
     $WithBreaks = $BodyHtml
 
@@ -457,7 +456,7 @@ function Get-DetailLines {
 
     foreach ($Raw in ($Plain -split "`r`n|`n|`r")) {
         $Line = ($Raw -replace '\s+', ' ').Trim()
-        }
+
         if (-not $Line) {
             continue
         }
@@ -473,12 +472,15 @@ function Get-DetailLines {
         if ($Line -match '^[А-ЯЁ][\p{L}\- ]+\s+округ(?:а)?\s*[,;:]?$') {
             $IsArea = $true
         }
+        if (
             ($Line -match '^город\s+') -or
             ($Line -match '^с\.\s*') -or
             ($Line -match '^пгт\.\s*') -or
             ($Line -match 'район(?:а)?$') -or
             ($Line -match 'округ(?:а)?$')
-        )
+        ) {
+            $IsArea = $true
+        }
 
         $Result += [pscustomobject]@{
             Text = $Line.Trim(' ', ',', ':', ';')
@@ -521,15 +523,15 @@ function Get-Article {
         $From = $Match.Groups[1].Value
         $To = $Match.Groups[2].Value
 
-    if ($From -notmatch ':') {
-        $From = $From + ':00'
-    }
+        if ($From -notmatch ':') {
+            $From = $From + ':00'
+        }
 
-    if ($To -notmatch ':') {
-        $To = $To + ':00'
-    }
+        if ($To -notmatch ':') {
+            $To = $To + ':00'
+        }
 
-    $TimePeriods += "с $From до $To"
+        $TimePeriods += "с $From до $To"
     }
 
     $TimePeriods = @($TimePeriods | Select-Object -Unique)
@@ -542,7 +544,7 @@ function Get-Article {
             [regex]::Matches($Text, '\b\d{1,2}:\d{2}\b') |
             ForEach-Object { $_.Value } |
             Select-Object -Unique
-         )
+        )
 
         $Time = $SingleTimes -join ', '
     }
