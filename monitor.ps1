@@ -420,6 +420,7 @@ function Get-DetailLines {
     param(
         [string]$BodyHtml
     )
+}
 
     $WithBreaks = $BodyHtml
 
