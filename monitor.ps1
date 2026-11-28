@@ -144,6 +144,15 @@ function Ensure-StateProperties {
         $State | Add-Member -NotePropertyName articles -NotePropertyValue @()
     }
 
+    # Отдельная история публикаций VK
+    if ($null -eq $State.vk_known_ids) {
+        $State | Add-Member -NotePropertyName vk_known_ids -NotePropertyValue @()
+    }
+
+    if ($null -eq $State.vk_initialized) {
+        $State | Add-Member -NotePropertyName vk_initialized -NotePropertyValue $false
+    }
+
     return $State
 }
 
@@ -1575,8 +1584,13 @@ function Get-Buttons {
 
     $Rows = @()
 
+    $SourceButtonText = '🌐 Открыть на сайте'
+    if ([string]$Article.Url -match '(?i)^https?://(?:www\.)?vk\.com/') {
+        $SourceButtonText = '🌐 Открыть в VK'
+    }
+
     $Rows += , @(
-        @{ text = '🌐 Открыть на сайте'; url = $Article.Url }
+        @{ text = $SourceButtonText; url = $Article.Url }
     )
 
     if (-not $SiteOnly) {
@@ -2084,6 +2098,182 @@ function Send-ChangeNotice {
 }
 
 # ============================================================
+# VK: ПУБЛИЧНАЯ СТЕНА БЕЗ API-КЛЮЧА
+# ============================================================
+
+function Get-VkWallPosts {
+    param([int]$Count = 10)
+
+    $WallUrl = 'https://vk.ru/wall-129160034'
+    $Headers = @{
+        'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        'Accept' = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'Accept-Language' = 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+        'Cache-Control' = 'no-cache'
+    }
+
+    try {
+        $Response = Invoke-WebRequest -Method Get -Uri $WallUrl -Headers $Headers -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        if ([int]$Response.StatusCode -ne 200) {
+            throw ('VK вернул HTTP {0}' -f [int]$Response.StatusCode)
+        }
+        $Html = [string]$Response.Content
+    }
+    catch {
+        Write-Warning ('VK: не удалось загрузить публичную стену: {0}' -f $_.Exception.Message)
+        return @()
+    }
+
+    # VK отдаёт данные постов внутри data-exec в HTML. Ищем блоки wall_post_cont,
+    # затем извлекаем id/date/text из сериализованного item.
+    $Markers = [regex]::Matches($Html, 'id="wpt-129160034_(\d+)"')
+    if ($Markers.Count -eq 0) {
+        Write-Warning 'VK: HTML загружен, но блоки публикаций не найдены. Формат страницы мог измениться.'
+        return @()
+    }
+
+    $Posts = @()
+    for ($i = 0; $i -lt $Markers.Count; $i++) {
+        $Marker = $Markers[$i]
+        $BlockStart = $Marker.Index
+        $BlockEnd = if ($i + 1 -lt $Markers.Count) { $Markers[$i + 1].Index } else { [Math]::Min($Html.Length, $BlockStart + 50000) }
+        $BlockLength = [Math]::Max(0, $BlockEnd - $BlockStart)
+        if ($BlockLength -eq 0) { continue }
+        $Block = $Html.Substring($BlockStart, $BlockLength)
+
+        $PostId = [long]$Marker.Groups[1].Value
+        $DateMatch = [regex]::Match($Block, '&quot;date&quot;:(\d+)')
+        $TextMatch = [regex]::Match($Block, '&quot;text&quot;:&quot;(.*?)&quot;,&quot;(?:views|copy_history|attachments)', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+
+        if (-not $DateMatch.Success -or -not $TextMatch.Success) {
+            # Не помечаем неполный блок как обработанный: следующий запуск попробует снова.
+            Write-Warning ('VK: не удалось разобрать публикацию #{0}.' -f $PostId)
+            continue
+        }
+
+        $RawText = [string]$TextMatch.Groups[1].Value
+        $PostText = [System.Net.WebUtility]::HtmlDecode($RawText)
+        $PostText = $PostText -replace '(?i)<br\s*/?>', "`n"
+        $PostText = $PostText -replace '(?i)</(?:div|p|li)>', "`n"
+        $PostText = [regex]::Replace($PostText, '<[^>]+>', ' ')
+        $PostText = $PostText -replace '\\r\\n|\\n|\\r', "`n"
+        $PostText = $PostText -replace '\\"', '"'
+        $PostText = $PostText -replace '\\\\', '\'
+        $PostText = [regex]::Replace($PostText, '[ \t]+', ' ')
+        $PostText = [regex]::Replace($PostText, '\n{3,}', "`n`n").Trim()
+
+        if ([string]::IsNullOrWhiteSpace($PostText)) { continue }
+
+        $Posts += [pscustomobject]@{
+            id = $PostId
+            owner_id = -129160034
+            date = [long]$DateMatch.Groups[1].Value
+            text = $PostText
+        }
+        if ($Posts.Count -ge $Count) { break }
+    }
+
+    # Стена идёт от новых к старым. Убираем дубли по ID, сохраняя порядок.
+    $Unique = @{}
+    $Result = @()
+    foreach ($Post in $Posts) {
+        $Key = [string]$Post.id
+        if (-not $Unique.ContainsKey($Key)) {
+            $Unique[$Key] = $true
+            $Result += $Post
+        }
+    }
+
+    Write-Host ('VK: HTML {0} символов, разобрано публикаций: {1}.' -f $Html.Length, $Result.Count)
+    return @($Result | Select-Object -First $Count)
+}
+
+function Convert-VkPostToArticle {
+    param($Post)
+
+    $Text = [string]$Post.text
+    $Lines = @($Text -split "`r`n|`n|`r" | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $Title = if ($Lines.Count -gt 0) { [string]$Lines[0] } else { 'Публикация Крымэнерго во ВКонтакте' }
+    if ($Title.Length -gt 110) { $Title = $Title.Substring(0, 107) + '...' }
+
+    $PostId = [long]$Post.id
+    $OwnerId = [long]$Post.owner_id
+    $Url = 'https://vk.ru/wall{0}_{1}' -f $OwnerId, $PostId
+    $PostDate = [DateTimeOffset]::FromUnixTimeSeconds([long]$Post.date).ToOffset([TimeSpan]::FromHours(3))
+    $Culture = [System.Globalization.CultureInfo]::GetCultureInfo('ru-RU')
+    $DateText = $PostDate.ToString('d MMMM yyyy', $Culture)
+
+    $TimePeriods = @(Get-TimePeriods -Text $Text)
+    $Dates = @(Get-DateMentions -Text ($Title + "`n" + $Text))
+    if ($Dates.Count -eq 0) { $Dates = @($DateText) }
+    $Type = Get-ArticleType -Title $Title -Text ($Title + "`n" + $Text) -TimePeriods $TimePeriods -Lines $Lines
+    $Place = Get-PlaceMentions -Title $Title -Text $Text -Lines $Lines
+    $Reason = Get-Reason -Text ($Title + "`n" + $Text)
+    $Phones = @(Get-Phones -Text $Text)
+    $HashSource = (Get-NormalizedKey -Text $Title) + '|' + (($Lines | ForEach-Object { Get-NormalizedKey -Text $_ }) -join '|')
+
+    return [pscustomobject]@{
+        Url = $Url; Title = $Title; Type = $Type; Date = ($Dates -join ', ')
+        Time = ($TimePeriods -join ', '); TimeNote = ''; Place = $Place
+        Reason = $Reason; Phones = $Phones; Lines = $Lines; Links = @()
+        Hash = (Get-Sha256 -Text $HashSource)
+    }
+}
+
+function Invoke-VkMonitor {
+    param($Config, $State)
+
+    $Posts = @(Get-VkWallPosts -Count 10)
+    if ($Posts.Count -eq 0) {
+        Write-Host 'VK: публикации не получены; состояние истории не меняем.'
+        return
+    }
+
+    $KnownIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($Id in @($State.vk_known_ids)) { if ($null -ne $Id) { [void]$KnownIds.Add([string]$Id) } }
+
+    # Первый запуск: только фиксируем последние 10 ID, ничего не рассылаем.
+    if (-not [bool]$State.vk_initialized) {
+        foreach ($Post in $Posts) { [void]$KnownIds.Add([string]$Post.id) }
+        $State.vk_known_ids = @($Posts | ForEach-Object { [string]$_.id })
+        $State.vk_initialized = $true
+        Write-Host ('VK: первичная инициализация. Запомнено {0} последних публикаций; рассылки нет.' -f $Posts.Count)
+        return
+    }
+
+    $Candidates = @($Posts | Where-Object { -not $KnownIds.Contains([string]$_.id) })
+    Write-Host ('VK: проверено последних {0}, новых публикаций: {1}.' -f $Posts.Count, $Candidates.Count)
+
+    # Отправка от старых к новым, чтобы сохранить хронологию.
+    [array]::Reverse($Candidates)
+    foreach ($Post in $Candidates) {
+        $Id = [string]$Post.id
+        $Article = Convert-VkPostToArticle -Post $Post
+        Write-Host ('VK candidate #{0}: {1} [{2}]' -f $Id, $Article.Title, $Article.Type)
+
+        if (@($Article.Lines).Count -gt 0 -and $Article.Type -in $SendTypes) {
+            if (Send-NewArticle -Article $Article -Config $Config -State $State) {
+                Write-Host ('VK: SENT #{0}' -f $Id)
+            }
+        }
+        else {
+            Write-Host ('VK: NOT SENT #{0} (пустой текст или тип отключён)' -f $Id)
+        }
+        [void]$KnownIds.Add($Id)
+    }
+
+    # Храним только ограниченную историю ID. В state.json не сохраняем HTML.
+    $Combined = @(@($Posts | ForEach-Object { [string]$_.id }) + @($State.vk_known_ids))
+    $Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $Ordered = @()
+    foreach ($Id in $Combined) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Id) -and $Seen.Add([string]$Id)) { $Ordered += [string]$Id }
+    }
+    $State.vk_known_ids = @($Ordered | Select-Object -First 500)
+    $State.vk_initialized = $true
+}
+
+# ============================================================
 # START
 # ============================================================
 
@@ -2212,6 +2402,12 @@ if (-not [bool]$State.initialized) {
     }
 
     $State.initialized = $true
+
+    # VK имеет собственную инициализацию: первый запуск читает не более 10 последних постов.
+    Write-Host ''
+    Write-Host 'VK MONITOR'
+    Invoke-VkMonitor -Config $Config -State $State
+
     Save-AllState
 
     Write-Host 'FIRST RUN COMPLETE.'
@@ -2338,6 +2534,12 @@ foreach ($Record in $Watch) {
 
     Save-AllState
 }
+
+# --- 3. Публикации VK (последние 10, дедупликация по ID) ----
+
+Write-Host ''
+Write-Host 'VK MONITOR'
+Invoke-VkMonitor -Config $Config -State $State
 
 Save-AllState
 
