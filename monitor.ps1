@@ -2124,68 +2124,135 @@ function Get-VkWallPosts {
         return @()
     }
 
-    # VK отдаёт данные постов внутри data-exec в HTML. Ищем блоки wall_post_cont,
-    # затем извлекаем id/date/text из сериализованного item.
-    $Markers = [regex]::Matches($Html, 'id="wpt-129160034_(\d+)"')
-    if ($Markers.Count -eq 0) {
-        Write-Warning 'VK: HTML загружен, но блоки публикаций не найдены. Формат страницы мог измениться.'
+    if ([string]::IsNullOrWhiteSpace($Html)) {
+        Write-Warning 'VK: сервер вернул пустую HTML-страницу.'
         return @()
     }
 
+    # Не привязываемся к id="wpt-...": VK периодически меняет HTML-контейнеры.
+    # Источник данных — JSON в атрибутах data-exec компонентов публикаций.
     $Posts = @()
-    for ($i = 0; $i -lt $Markers.Count; $i++) {
-        $Marker = $Markers[$i]
-        $BlockStart = $Marker.Index
-        $BlockEnd = if ($i + 1 -lt $Markers.Count) { $Markers[$i + 1].Index } else { [Math]::Min($Html.Length, $BlockStart + 50000) }
-        $BlockLength = [Math]::Max(0, $BlockEnd - $BlockStart)
-        if ($BlockLength -eq 0) { continue }
-        $Block = $Html.Substring($BlockStart, $BlockLength)
+    $SeenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $DataExecMatches = [regex]::Matches(
+        $Html,
+        'data-exec="([^"\\]*(?:\\.[^"\\]*)*)"',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline
+    )
 
-        $PostId = [long]$Marker.Groups[1].Value
-        $DateMatch = [regex]::Match($Block, '&quot;date&quot;:(\d+)')
-        $TextMatch = [regex]::Match($Block, '&quot;text&quot;:&quot;(.*?)&quot;,&quot;(?:views|copy_history|attachments)', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    foreach ($DataMatch in $DataExecMatches) {
+        $RawAttribute = [string]$DataMatch.Groups[1].Value
+        if ($RawAttribute -notmatch 'PostContentContainer|wall_wallpost|&quot;item&quot;') { continue }
 
-        if (-not $DateMatch.Success -or -not $TextMatch.Success) {
-            # Не помечаем неполный блок как обработанный: следующий запуск попробует снова.
-            Write-Warning ('VK: не удалось разобрать публикацию #{0}.' -f $PostId)
+        try {
+            $JsonText = [System.Net.WebUtility]::HtmlDecode($RawAttribute)
+            $Payload = ConvertFrom-Json -InputObject $JsonText -ErrorAction Stop
+            $Container = $Payload.'PostContentContainer/init'
+            if ($null -eq $Container) {
+                # На случай изменения имени компонента VK.
+                foreach ($Property in $Payload.PSObject.Properties) {
+                    if ($null -ne $Property.Value -and $null -ne $Property.Value.item) {
+                        $Container = $Property.Value
+                        break
+                    }
+                }
+            }
+            if ($null -eq $Container -or $null -eq $Container.item) { continue }
+
+            $Item = $Container.item
+            $PostId = [long]$Item.id
+            $OwnerId = [long]$Item.owner_id
+            $UnixDate = [long]$Item.date
+            $PostText = [string]$Item.text
+
+            if ($OwnerId -ne -129160034 -or $PostId -le 0 -or $UnixDate -le 0) { continue }
+            if ([string]::IsNullOrWhiteSpace($PostText)) { continue }
+            if (-not $SeenIds.Add([string]$PostId)) { continue }
+
+            # В JSON-тексте VK могут находиться HTML-теги и HTML-сущности.
+            $PostText = [System.Net.WebUtility]::HtmlDecode($PostText)
+            $PostText = $PostText -replace '(?i)<br\s*/?>', "`n"
+            $PostText = $PostText -replace '(?i)</(?:div|p|li)>', "`n"
+            $PostText = [regex]::Replace($PostText, '<[^>]+>', ' ')
+            $PostText = [System.Net.WebUtility]::HtmlDecode($PostText)
+            $PostText = $PostText -replace "`r`n|`r", "`n"
+            $PostText = [regex]::Replace($PostText, '[ \t]+', ' ')
+            $PostText = [regex]::Replace($PostText, '\n{3,}', "`n`n").Trim()
+            if ([string]::IsNullOrWhiteSpace($PostText)) { continue }
+
+            $Posts += [pscustomobject]@{
+                id = $PostId
+                owner_id = $OwnerId
+                date = $UnixDate
+                text = $PostText
+            }
+            if ($Posts.Count -ge $Count) { break }
+        }
+        catch {
+            # Не прекращаем разбор из-за служебного data-exec или отдельного
+            # повреждённого блока: пробуем следующие компоненты страницы.
             continue
         }
-
-        $RawText = [string]$TextMatch.Groups[1].Value
-        $PostText = [System.Net.WebUtility]::HtmlDecode($RawText)
-        $PostText = $PostText -replace '(?i)<br\s*/?>', "`n"
-        $PostText = $PostText -replace '(?i)</(?:div|p|li)>', "`n"
-        $PostText = [regex]::Replace($PostText, '<[^>]+>', ' ')
-        $PostText = $PostText -replace '\\r\\n|\\n|\\r', "`n"
-        $PostText = $PostText -replace '\\"', '"'
-        $PostText = $PostText -replace '\\\\', '\'
-        $PostText = [regex]::Replace($PostText, '[ \t]+', ' ')
-        $PostText = [regex]::Replace($PostText, '\n{3,}', "`n`n").Trim()
-
-        if ([string]::IsNullOrWhiteSpace($PostText)) { continue }
-
-        $Posts += [pscustomobject]@{
-            id = $PostId
-            owner_id = -129160034
-            date = [long]$DateMatch.Groups[1].Value
-            text = $PostText
-        }
-        if ($Posts.Count -ge $Count) { break }
     }
 
-    # Стена идёт от новых к старым. Убираем дубли по ID, сохраняя порядок.
-    $Unique = @{}
-    $Result = @()
-    foreach ($Post in $Posts) {
-        $Key = [string]$Post.id
-        if (-not $Unique.ContainsKey($Key)) {
-            $Unique[$Key] = $true
-            $Result += $Post
+    # Резервный парсер на случай, если VK переставит JSON-компонент в другой
+    # data-exec, но оставит сериализованные поля item.
+    if ($Posts.Count -eq 0) {
+        $DecodedHtml = [System.Net.WebUtility]::HtmlDecode($Html)
+        $ItemMarkers = [regex]::Matches($DecodedHtml, '"item"\s*:\s*\{')
+        foreach ($ItemMarker in $ItemMarkers) {
+            $Start = $ItemMarker.Index + $ItemMarker.Length - 1
+            $Depth = 0
+            $InString = $false
+            $Escaped = $false
+            $End = -1
+            for ($i = $Start; $i -lt $DecodedHtml.Length; $i++) {
+                $Ch = $DecodedHtml[$i]
+                if ($InString) {
+                    if ($Escaped) { $Escaped = $false; continue }
+                    if ($Ch -eq '\') { $Escaped = $true; continue }
+                    if ($Ch -eq '"') { $InString = $false }
+                    continue
+                }
+                if ($Ch -eq '"') { $InString = $true; continue }
+                if ($Ch -eq '{') { $Depth++ }
+                elseif ($Ch -eq '}') {
+                    $Depth--
+                    if ($Depth -eq 0) { $End = $i; break }
+                }
+            }
+            if ($End -lt $Start) { continue }
+            try {
+                $Item = ConvertFrom-Json -InputObject $DecodedHtml.Substring($Start, $End - $Start + 1) -ErrorAction Stop
+                if ([long]$Item.owner_id -ne -129160034 -or [long]$Item.id -le 0 -or [long]$Item.date -le 0) { continue }
+                if ([string]::IsNullOrWhiteSpace([string]$Item.text)) { continue }
+                if (-not $SeenIds.Add([string]$Item.id)) { continue }
+                $PostText = [System.Net.WebUtility]::HtmlDecode([string]$Item.text)
+                $PostText = $PostText -replace '(?i)<br\s*/?>', "`n"
+                $PostText = $PostText -replace '(?i)</(?:div|p|li)>', "`n"
+                $PostText = [regex]::Replace($PostText, '<[^>]+>', ' ')
+                $PostText = [System.Net.WebUtility]::HtmlDecode($PostText)
+                $PostText = [regex]::Replace($PostText, '[ \t]+', ' ')
+                $PostText = [regex]::Replace($PostText, '\n{3,}', "`n`n").Trim()
+                if ([string]::IsNullOrWhiteSpace($PostText)) { continue }
+                $Posts += [pscustomobject]@{ id = [long]$Item.id; owner_id = [long]$Item.owner_id; date = [long]$Item.date; text = $PostText }
+                if ($Posts.Count -ge $Count) { break }
+            }
+            catch { continue }
         }
     }
 
-    Write-Host ('VK: HTML {0} символов, разобрано публикаций: {1}.' -f $Html.Length, $Result.Count)
-    return @($Result | Select-Object -First $Count)
+    # Если разметка снова изменилась, выводим диагностику без изменения state.json.
+    if ($Posts.Count -eq 0) {
+        $WptCount = [regex]::Matches($Html, 'wpt-129160034_\d+').Count
+        $ExecCount = $DataExecMatches.Count
+        Write-Warning ('VK: HTML загружен ({0} символов), публикации не извлечены. data-exec={1}, wpt-маркеров={2}, PostContentContainer={3}.' -f $Html.Length, $ExecCount, $WptCount, ($Html.Contains('PostContentContainer')))
+        return @()
+    }
+
+    # Сортируем от новых к старым по времени публикации и возвращаем только Count.
+    $SortedPosts = @($Posts | Sort-Object -Property date -Descending | Select-Object -First $Count)
+    Write-Host ('VK: HTML {0} символов, data-exec: {1}, разобрано публикаций: {2}.' -f $Html.Length, $DataExecMatches.Count, $SortedPosts.Count)
+    return @($SortedPosts)
 }
 
 function Convert-VkPostToArticle {
