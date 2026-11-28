@@ -52,20 +52,24 @@ $MonthList = @(
 )
 $MonthNames = $MonthList -join '|'
 
+$DayNames = @('воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота')
+
 $TypeInfo = @{
-    outage  = @{ Badge = '🔴'; Label = 'ОТКЛЮЧЕНИЯ' }
-    warning = @{ Badge = '🟠'; Label = 'ПРЕДУПРЕЖДЕНИЕ' }
-    news    = @{ Badge = '🔵'; Label = 'НОВОСТЬ' }
+    outage  = @{ Badge = '🔴'; Label = 'ОТКЛЮЧЕНИЕ';     Icon = '⚡' }
+    warning = @{ Badge = '🟠'; Label = 'ПРЕДУПРЕЖДЕНИЕ'; Icon = '⚠️' }
+    news    = @{ Badge = '🔵'; Label = 'НОВОСТЬ';        Icon = '📰' }
 }
 
 # Признаки типа по заголовку
-$OutageTitleRx = 'отключ|обесточ|график\p{L}*\s+(?:отключ|ремонт|работ)|плановы\p{L}*\s+(?:работ|ремонт)|перерыв\p{L}*\s+в\s+(?:электро|энерго)снабжен|без\s+(?:света|электро\p{L}+)|ограничени\p{L}*\s+(?:электро|энерго)'
+$OutageTitleRx = 'отключ|обесточ|(?<!\p{L})ремонт|неотложн|восстановительн|аварийн\p{L}*\s+(?:работ|отключ)|график\p{L}*\s+(?:отключ|ремонт|работ)|плановы\p{L}*\s+(?:работ|ремонт)|перерыв\p{L}*\s+в\s+(?:электро|энерго)снабжен|отсутствует\s+(?:электро|энерго)снабжен|нарушен\p{L}*\s+(?:электро|энерго)снабжен|без\s+(?:света|электро\p{L}+)|нет\s+(?:света|электро\p{L}+)|ограничени\p{L}*\s+(?:электро|энерго)'
 $WarningTitleRx = 'опасн|предупрежд|гидрометеор|метеор|штормов|непогод|ураган|гололед|гололёд|снегопад|ливн|мороз|жара|пожароопасн|режим\p{L}*\s+повышенной|чрезвычайн|внимани|напомина|рекомендац|как\s+действовать|куда\s+сообщ'
 
 # Признаки типа по тексту
 $OutageBodyPatterns = @(
     'отключен', 'обесточ', 'плановы\p{L}*\s+(?:работ|ремонт)',
-    'график', 'ремонтн\p{L}*\s+работ', 'перерыв\p{L}*\s+в\s+(?:электро|энерго)снабжен'
+    'график', 'ремонт', 'неотложн\p{L}*\s+работ',
+    'отсутствует\s+(?:электро|энерго)снабжен',
+    'перерыв\p{L}*\s+в\s+(?:электро|энерго)снабжен'
 )
 $WarningBodyPatterns = @(
     'порыв', 'ветр', 'шторм', 'ураган', 'гололед', 'гололёд', 'снегопад', 'ливн',
@@ -779,7 +783,258 @@ function Get-TimePeriods {
         }
     }
 
+    # Если полного периода нет, ищем только конец ("до 19 часов", "до 19:00")
+    if ($Result.Count -eq 0) {
+        $PatternC = '(?<![\p{L}\d:.,])(?:до|не\s+позднее)\s*(?<h>\d{1,2})(?:[:.](?<m>\d{2}))?(?<hr>' + $HourMark + ')?(?!\d)(?![.:]\d)'
+
+        foreach ($Match in [regex]::Matches($Text, $PatternC, 'IgnoreCase')) {
+            $HasM = $Match.Groups['m'].Success
+            $HasHr = $Match.Groups['hr'].Success
+
+            if ((-not $HasM) -and (-not $HasHr)) { continue }
+
+            $H = [int]$Match.Groups['h'].Value
+            $M = 0
+            if ($HasM) { $M = [int]$Match.Groups['m'].Value }
+
+            if ($H -gt 24 -or $M -gt 59) { continue }
+            if (($H -eq 24) -and ($M -ne 0)) { continue }
+
+            # "до 3 часов" чаще означает длительность, а не время
+            if ((-not $HasM) -and ($H -lt 6)) { continue }
+
+            $TailStart = $Match.Index + $Match.Length
+            $Tail = $Text.Substring($TailStart, [Math]::Min(20, $Text.Length - $TailStart))
+
+            if ($Tail -match $NotTimeTailRx) { continue }
+
+            $Period = 'до {0:00}:{1:00}' -f $H, $M
+
+            if ($Result -notcontains $Period) {
+                $Result += $Period
+            }
+        }
+    }
+
+    # Только начало ("с 9 часов", "с 09:30")
+    if ($Result.Count -eq 0) {
+        $PatternD = '(?<![\p{L}\d:.,])[сc]\s*(?<h>\d{1,2})(?:[:.](?<m>\d{2}))?(?<hr>' + $HourMark + ')?(?!\d)(?![.:]\d)(?!\s*(?:до|по|-|–|—))'
+
+        foreach ($Match in [regex]::Matches($Text, $PatternD, 'IgnoreCase')) {
+            $HasM = $Match.Groups['m'].Success
+            $HasHr = $Match.Groups['hr'].Success
+
+            if ((-not $HasM) -and (-not $HasHr)) { continue }
+
+            $H = [int]$Match.Groups['h'].Value
+            $M = 0
+            if ($HasM) { $M = [int]$Match.Groups['m'].Value }
+
+            if ($H -gt 23 -or $M -gt 59) { continue }
+
+            $TailStart = $Match.Index + $Match.Length
+            $Tail = $Text.Substring($TailStart, [Math]::Min(20, $Text.Length - $TailStart))
+
+            if ($Tail -match $NotTimeTailRx) { continue }
+
+            $Period = 'с {0:00}:{1:00}' -f $H, $M
+
+            if ($Result -notcontains $Period) {
+                $Result += $Period
+            }
+        }
+    }
+
     return @($Result)
+}
+
+# ============================================================
+# ВАЖНОЕ ДЛЯ ШАПКИ: МЕСТО, ПРИЧИНА, ТЕЛЕФОНЫ, ДАТА
+# ============================================================
+
+# Места: "в селе Веселое", "городского округа Судак", "Белогорском районе", списки "г. Симферополь"
+function Get-PlaceMentions {
+    param(
+        [string]$Title,
+        [string]$Text,
+        [string[]]$Lines
+    )
+
+    $Source = $Title + "`n" + $Text
+    $Name = '\p{Lu}[\p{L}\-]{2,}(?:\s+\p{Lu}[\p{L}\-]{2,})?'
+    $Items = @()
+
+    $Kinds = @{
+        'селе' = 'с.'; 'селах' = 'с.'
+        'городе' = 'г.'; 'городах' = 'г.'
+        'пгт' = 'пгт'
+        'посёлке' = 'пос.'; 'поселке' = 'пос.'
+        'микрорайоне' = 'мкр.'
+    }
+
+    # Ключевые слова ищем без учёта регистра, а названия - только с заглавной буквы
+    $P1 = '(?<![\p{L}])(?i:(?:в|во|на)\s+(?<k>селе|селах|городе|городах|пгт|посёлке|поселке|микрорайоне))\s+(?<n>' + $Name + ')'
+
+    foreach ($Match in [regex]::Matches($Source, $P1)) {
+        $Items += [pscustomobject]@{
+            Prio = 1
+            Text = ('{0} {1}' -f $Kinds[$Match.Groups['k'].Value.ToLowerInvariant()], $Match.Groups['n'].Value)
+            Name = $Match.Groups['n'].Value
+        }
+    }
+
+    $P2 = '(?<![\p{L}/])(?<k>(?i:с\.|г\.|пгт\.?|пос\.))\s*(?<n>' + $Name + ')'
+
+    foreach ($Match in [regex]::Matches($Source, $P2)) {
+        $K = $Match.Groups['k'].Value.ToLowerInvariant().TrimEnd('.')
+
+        if ($K -ne 'пгт') {
+            $K = $K + '.'
+        }
+
+        $Items += [pscustomobject]@{
+            Prio = 1
+            Text = ('{0} {1}' -f $K, $Match.Groups['n'].Value)
+            Name = $Match.Groups['n'].Value
+        }
+    }
+
+    $P3 = '(?i:(?:городск\p{L}+|муниципальн\p{L}+)\s+округ\p{L}*)\s+(?<n>' + $Name + ')'
+
+    foreach ($Match in [regex]::Matches($Source, $P3)) {
+        $Items += [pscustomobject]@{
+            Prio = 3
+            Text = ('г.о. {0}' -f $Match.Groups['n'].Value)
+            Name = $Match.Groups['n'].Value
+        }
+    }
+
+    foreach ($Match in [regex]::Matches($Source, '(?<n>\p{Lu}[\p{L}\-]+)\s+район(?:е|а|ом|ы|ов)?(?![\p{L}])')) {
+        $Adj = $Match.Groups['n'].Value
+        $Adj = $Adj -replace 'ск(?:ом|ого|ому|им|ие|их)$', 'ский'
+        $Adj = $Adj -replace 'цк(?:ом|ого|ому|им|ие|их)$', 'цкий'
+
+        $Items += [pscustomobject]@{
+            Prio = 2
+            Text = ('{0} район' -f $Adj)
+            Name = $Adj
+        }
+    }
+
+    # Списки территорий в тексте
+    $AreaLines = @($Lines | Where-Object { (Test-AreaLine -Line $_) -and ($_ -notmatch 'район|округ') })
+
+    foreach ($Line in $AreaLines) {
+        $Clean = $Line.Trim(' ', ',', ':', ';', '.')
+
+        $Items += [pscustomobject]@{
+            Prio = 2
+            Text = $Clean
+            Name = $Clean
+        }
+    }
+
+    # Сначала населённые пункты, потом районы, потом округа; дубли убираем
+    $Out = @()
+    $SeenKeys = @()
+    $SettlementNames = @(
+        $Items | Where-Object { $_.Prio -eq 1 } |
+        ForEach-Object { Get-NormalizedKey -Text $_.Name }
+    )
+
+    foreach ($Item in ($Items | Sort-Object Prio -Stable)) {
+        $Key = Get-NormalizedKey -Text $Item.Text
+        $NameKey = Get-NormalizedKey -Text $Item.Name
+
+        if ($SeenKeys -contains $Key) { continue }
+
+        # "г.о. Судак" не нужен, если уже есть "г. Судак"
+        if (($Item.Prio -eq 3) -and ($SettlementNames -contains $NameKey)) { continue }
+
+        $SeenKeys += $Key
+        $Out += $Item.Text
+    }
+
+    if ($Out.Count -gt 4) {
+        $More = $Out.Count - 3
+        $Out = @($Out | Select-Object -First 3)
+        $Out += ('и ещё {0}' -f $More)
+    }
+
+    return ($Out -join ', ')
+}
+
+function Get-Reason {
+    param(
+        [string]$Text
+    )
+
+    $L = $Text.ToLowerInvariant()
+
+    if ($L -match 'неотложн') { return 'неотложные работы' }
+    if ($L -match 'аварийн\p{L}*\s+(?:работ|ремонт|отключ)') { return 'аварийные работы' }
+    if ($L -match 'плановы\p{L}*\s+(?:работ|ремонт|отключ)') { return 'плановые работы' }
+    if ($L -match '(?<!\p{L})ремонт') { return 'ремонтные работы' }
+    if ($L -match 'погодн|ветер|ветра|шторм|ураган|гололед|гололёд|снегопад|ливн') { return 'непогода' }
+
+    return ''
+}
+
+function Get-Phones {
+    param(
+        [string]$Text
+    )
+
+    $Result = @()
+
+    foreach ($Match in [regex]::Matches($Text, '(?<!\d)(?:8|0)\s?800[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}(?!\d)')) {
+        $Phone = ($Match.Value -replace '\s+', ' ').Trim()
+
+        if ($Result -notcontains $Phone) {
+            $Result += $Phone
+        }
+    }
+
+    return @($Result | Select-Object -First 2)
+}
+
+# "23 ноября 2026" -> "23 ноября 2026 (понедельник)"; сегодня/завтра подписываем словами
+function Format-DateLabel {
+    param(
+        [string]$DateText
+    )
+
+    $Today = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(3)).Date
+    $Parts = @()
+
+    foreach ($Item in ($DateText -split ',\s*')) {
+        $Label = $Item
+
+        $Match = [regex]::Match($Item, '^(\d{1,2})\s+(' + $MonthNames + ')\s+(\d{4})$')
+
+        if ($Match.Success) {
+            $Month = [array]::IndexOf($MonthList, $Match.Groups[2].Value) + 1
+
+            try {
+                $Date = [datetime]::new([int]$Match.Groups[3].Value, $Month, [int]$Match.Groups[1].Value)
+                $Diff = ($Date.Date - $Today).Days
+                $Extra = $DayNames[[int]$Date.DayOfWeek]
+
+                if ($Diff -eq 0) { $Extra = 'сегодня, ' + $Extra }
+                elseif ($Diff -eq 1) { $Extra = 'завтра, ' + $Extra }
+                elseif ($Diff -eq -1) { $Extra = 'вчера, ' + $Extra }
+
+                $Label = '{0} ({1})' -f $Item, $Extra
+            }
+            catch {
+                $Label = $Item
+            }
+        }
+
+        $Parts += $Label
+    }
+
+    return ($Parts -join ', ')
 }
 
 # ============================================================
@@ -885,6 +1140,15 @@ function Get-Article {
     $Dates = @(Get-DateMentions -Text ($Title + "`n" + $Text))
     $Type = Get-ArticleType -Title $Title -Text ($Title + "`n" + $Text) -TimePeriods $TimePeriods -Lines $Lines
 
+    $TimeNote = ''
+    if ($Text -match '(?i)ориентировочн|примерн|предположительн') {
+        $TimeNote = 'ориентировочно'
+    }
+
+    $Place = Get-PlaceMentions -Title $Title -Text $Text -Lines $Lines
+    $Reason = Get-Reason -Text ($Title + "`n" + $Text)
+    $Phones = @(Get-Phones -Text $Text)
+
     $HashSource = (Get-NormalizedKey -Text $Title) + '|' +
         (($Lines | ForEach-Object { Get-NormalizedKey -Text $_ }) -join '|')
 
@@ -894,6 +1158,10 @@ function Get-Article {
         Type = $Type
         Date = ($Dates -join ', ')
         Time = ($TimePeriods -join ', ')
+        TimeNote = $TimeNote
+        Place = $Place
+        Reason = $Reason
+        Phones = $Phones
         Lines = $Lines
         Links = $Links
         Hash = (Get-Sha256 -Text $HashSource)
@@ -1244,7 +1512,7 @@ function Join-Quote {
         $Tag = '<blockquote expandable>'
     }
 
-    return ($Prefix + "`n`n" + $Tag + ($Lines -join "`n") + '</blockquote>')
+    return ($Prefix + "`n" + $Tag + ($Lines -join "`n") + '</blockquote>')
 }
 
 function Format-PostParts {
@@ -1258,21 +1526,40 @@ function Format-PostParts {
     $Head = @()
     $Head += ('{0} <b>{1}</b> · Крымэнерго' -f $Info.Badge, $Info.Label)
     $Head += ''
-    $Head += ('<b>{0}</b>' -f (ConvertTo-TgHtml -Text $Article.Title))
+    $Head += ('{0} <b>{1}</b>' -f $Info.Icon, (ConvertTo-TgHtml -Text $Article.Title))
 
-    $Meta = @()
+    # Главное - сразу под заголовком
+    $Facts = @()
 
     if (($Article.Type -in @('outage', 'warning')) -and $Article.Date) {
-        $Meta += ('📅 {0}' -f (ConvertTo-TgHtml -Text $Article.Date))
+        $Facts += ('📅 <b>Когда:</b> {0}' -f (ConvertTo-TgHtml -Text (Format-DateLabel -DateText $Article.Date)))
     }
 
     if (($Article.Type -eq 'outage') -and $Article.Time) {
-        $Meta += ('🕒 {0}' -f (ConvertTo-TgHtml -Text $Article.Time))
+        $TimeText = ConvertTo-TgHtml -Text $Article.Time
+
+        if ($Article.TimeNote) {
+            $TimeText += ' <i>(' + (ConvertTo-TgHtml -Text $Article.TimeNote) + ')</i>'
+        }
+
+        $Facts += ('🕒 <b>Время:</b> {0}' -f $TimeText)
     }
 
-    if ($Meta.Count -gt 0) {
+    if (($Article.Type -eq 'outage') -and $Article.Place) {
+        $Facts += ('📍 <b>Где:</b> {0}' -f (ConvertTo-TgHtml -Text $Article.Place))
+    }
+
+    if (($Article.Type -eq 'outage') -and $Article.Reason) {
+        $Facts += ('🔧 <b>Причина:</b> {0}' -f (ConvertTo-TgHtml -Text $Article.Reason))
+    }
+
+    if (($Article.Type -eq 'warning') -and (@($Article.Phones).Count -gt 0)) {
+        $Facts += ('📞 <b>Горячая линия:</b> {0}' -f (ConvertTo-TgHtml -Text (@($Article.Phones) -join '  ·  ')))
+    }
+
+    if ($Facts.Count -gt 0) {
         $Head += ''
-        $Head += $Meta
+        $Head += $Facts
     }
 
     $HeadText = ($Head -join "`n")
@@ -1288,10 +1575,14 @@ function Format-PostParts {
     $Total = 0
     foreach ($B in $BodyLines) { $Total += $B.Length + 1 }
 
-    $Expandable = ($Total -gt 600)
+    $Expandable = ($Total -gt 350)
 
     $Parts = @()
     $Prefix = $HeadText
+
+    if ($BodyLines.Count -gt 0) {
+        $Prefix += "`n`n📝 <b>Подробности</b>"
+    }
     $Current = @()
     $CurrentLen = 0
 
@@ -1346,6 +1637,7 @@ function Compare-Article {
 
     $OldTime = [string]$Record.time
     $OldDate = [string]$Record.date
+    $OldPlace = [string]$Record.place
 
     $TimeChanged = ($Article.Type -eq 'outage') -and ($OldTime -ne $Article.Time) -and ($OldTime -or $Article.Time)
     $DateChanged = ($Article.Type -in @('outage', 'warning')) -and ($OldDate -ne $Article.Date) -and ($OldDate -or $Article.Date)
@@ -1360,6 +1652,8 @@ function Compare-Article {
         OldTime = $OldTime
         DateChanged = $DateChanged
         OldDate = $OldDate
+        PlaceChanged = ($Article.Type -eq 'outage') -and $OldPlace -and ($OldPlace -ne $Article.Place)
+        OldPlace = $OldPlace
     }
 }
 
@@ -1417,6 +1711,13 @@ function Format-ChangeMessage {
         $Text += ('📅 Дата: <s>{0}</s> → {1}' -f
             (ConvertTo-TgHtml -Text $(if ($Diff.OldDate) { $Diff.OldDate } else { 'не указана' })),
             (ConvertTo-TgHtml -Text $(if ($Article.Date) { $Article.Date } else { 'не указана' })))
+    }
+
+    if ($Diff.PlaceChanged) {
+        $Text += ''
+        $Text += ('📍 Где: <s>{0}</s> → {1}' -f
+            (ConvertTo-TgHtml -Text $Diff.OldPlace),
+            (ConvertTo-TgHtml -Text $(if ($Article.Place) { $Article.Place } else { 'не указано' })))
     }
 
     if ($Diff.TimeChanged) {
@@ -1502,6 +1803,7 @@ function Send-NewArticle {
         type = $Article.Type
         date = $Article.Date
         time = $Article.Time
+        place = $Article.Place
         hash = $Article.Hash
         lines = @($Article.Lines)
         first_seen = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -1795,6 +2097,12 @@ foreach ($Record in $Watch) {
     $Record.type = $Article.Type
     $Record.date = $Article.Date
     $Record.time = $Article.Time
+
+    if ($null -eq $Record.PSObject.Properties['place']) {
+        $Record | Add-Member -NotePropertyName place -NotePropertyValue ''
+    }
+
+    $Record.place = $Article.Place
     $Record.hash = $Article.Hash
     $Record.lines = @($Article.Lines)
 
