@@ -848,6 +848,120 @@ function Get-TimePeriods {
     return @($Result)
 }
 
+
+# ============================================================
+# СПРАВОЧНИК НАСЕЛЁННЫХ ПУНКТОВ
+# ============================================================
+
+function Get-SettlementDirectory {
+    if ($null -ne $script:SettlementDirectory) {
+        return @($script:SettlementDirectory)
+    }
+
+    $Path = Join-Path $ScriptDirectory 'settlements.json'
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Warning ('Не найден справочник населённых пунктов: {0}. Используется прежнее распознавание.' -f $Path)
+        $script:SettlementDirectory = @()
+        return @()
+    }
+
+    try {
+        $Data = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $script:SettlementDirectory = @($Data.settlements)
+        Write-Host ('Settlement directory loaded: {0}' -f @($script:SettlementDirectory).Count)
+        return @($script:SettlementDirectory)
+    }
+    catch {
+        Write-Warning ('Не удалось прочитать settlements.json: {0}. Используется прежнее распознавание.' -f $_.Exception.Message)
+        $script:SettlementDirectory = @()
+        return @()
+    }
+}
+
+function Get-DirectoryPlaceMentions {
+    param(
+        [string]$Source,
+        [string[]]$Lines
+    )
+
+    $Items = @()
+    $Directory = @(Get-SettlementDirectory)
+
+    foreach ($Entry in $Directory) {
+        $Aliases = @($Entry.name) + @($Entry.aliases)
+        $Aliases = @($Aliases | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object Length -Descending -Unique)
+        $Matched = $false
+        $MatchedAlias = ''
+
+        foreach ($Alias in $Aliases) {
+            $Escaped = [regex]::Escape([string]$Alias)
+            $Pattern = '(?<![\p{L}\p{Nd}])' + $Escaped + '(?![\p{L}\p{Nd}])'
+            $Matches = [regex]::Matches($Source, $Pattern, 'IgnoreCase')
+
+            foreach ($Match in $Matches) {
+                $Start = [Math]::Max(0, $Match.Index - 35)
+                $Length = [Math]::Min(100, $Source.Length - $Start)
+                $Context = $Source.Substring($Start, $Length)
+
+                # Без типа населённого пункта принимаем совпадение, если оно похоже
+                # на заголовок адресного блока: «Мирное — ул. ...», «Мирное: ул. ...».
+                $Explicit = $Context -match '(?i)(?:\bс\.?\s*|\bсело\s+|\bпос(?:ёлок|елок)?\s+|\bпгт\.?\s*)' + $Escaped
+                $AddressBlock = $Context -match '(?i)' + $Escaped + '\s*(?:[-–—:,]|\r?\n)\s*(?:ул\.?|улиц|пер\.?|переул|просп|шоссе|дом|д\.)'
+                $LineStart = $Context -match '(?im)(?:^|\r?\n)\s*' + $Escaped + '\s*(?:$|[,;:.])'
+
+                if (-not ($Explicit -or $AddressBlock -or $LineStart)) {
+                    continue
+                }
+
+                $Matched = $true
+                $MatchedAlias = [string]$Alias
+                break
+            }
+
+            if ($Matched) { break }
+        }
+
+        if (-not $Matched) { continue }
+
+        $Kind = [string]$Entry.kind
+        $Prefix = switch ($Kind) {
+            'city' { 'г.' }
+            'urban_settlement' { 'пгт' }
+            'settlement' { 'пос.' }
+            'village' { 'с.' }
+            default { '' }
+        }
+
+        $DisplayName = [string]$Entry.name
+        $PlaceText = if ($Prefix) { '{0} {1}' -f $Prefix, $DisplayName } else { $DisplayName }
+
+        $Items += [pscustomobject]@{
+            Prio = 1
+            Text = $PlaceText
+            Name = $DisplayName
+            Admin = [string]$Entry.admin
+        }
+
+        # Административную принадлежность добавляем только если она однозначно
+        # указана у конкретной записи справочника.
+        if (-not [string]::IsNullOrWhiteSpace([string]$Entry.admin)) {
+            $AdminText = [string]$Entry.admin
+            if ($AdminText -notmatch '(?i)район|округ') {
+                $AdminText += ' район'
+            }
+            $Items += [pscustomobject]@{
+                Prio = 2
+                Text = $AdminText
+                Name = $AdminText
+                Admin = ''
+            }
+        }
+    }
+
+    return @($Items)
+}
+
 # ============================================================
 # ВАЖНОЕ ДЛЯ ШАПКИ: МЕСТО, ПРИЧИНА, ТЕЛЕФОНЫ, ДАТА
 # ============================================================
@@ -920,6 +1034,9 @@ function Get-PlaceMentions {
             Name = $Adj
         }
     }
+
+    # Справочник: позволяет находить населённые пункты без слов «село», «город» и т.п.
+    $Items += @(Get-DirectoryPlaceMentions -Source $Source -Lines $Lines)
 
     # Списки территорий в тексте
     $AreaLines = @($Lines | Where-Object { (Test-AreaLine -Line $_) -and ($_ -notmatch 'район|округ') })
