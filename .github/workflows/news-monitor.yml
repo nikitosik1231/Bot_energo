@@ -1,8 +1,9 @@
 name: Crimea Energy news monitor
 
 on:
+  # Запасной запуск раз в 3 часа. Основной запуск - через cron-job.org
   schedule:
-    - cron: '17 * * * *'   # <--- ЭТОТ ТРИГГЕР ОТСУТСТВУЕТ!
+    - cron: '17 */3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -30,15 +31,18 @@ jobs:
           $config = @{
             telegram_bot_token = $env:TELEGRAM_BOT_TOKEN
             news_url = 'https://crimea-energy.ru/about/news'
-            send_existing_on_first_run = $true
           }
           $config | ConvertTo-Json | Set-Content config.json -Encoding utf8
 
       - name: Check news and send updates
         shell: pwsh
-        run: pwsh -NoProfile -File monitor.ps1
+        timeout-minutes: 6
+        run: ./monitor.ps1
 
+      # always(): состояние сохраняется, даже если предыдущий шаг упал.
+      # Иначе уже отправленные новости могли бы прийти повторно.
       - name: Save processing history
+        if: always()
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
