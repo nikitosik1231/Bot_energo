@@ -1005,36 +1005,137 @@ function Format-DateLabel {
     )
 
     $Today = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(3)).Date
-    $Parts = @()
+    $ShortDays = @('вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб')
+
+    $Entries = @()
 
     foreach ($Item in ($DateText -split ',\s*')) {
-        $Label = $Item
+        $Item = $Item.Trim()
 
-        $Match = [regex]::Match($Item, '^(\d{1,2})\s+(' + $MonthNames + ')\s+(\d{4})$')
+        if (-not $Item) { continue }
+
+        $Match = [regex]::Match($Item, '^(\d{1,2})\s+(' + $MonthNames + ')(?:\s+(\d{4}))?$')
 
         if ($Match.Success) {
-            $Month = [array]::IndexOf($MonthList, $Match.Groups[2].Value) + 1
-
-            try {
-                $Date = [datetime]::new([int]$Match.Groups[3].Value, $Month, [int]$Match.Groups[1].Value)
-                $Diff = ($Date.Date - $Today).Days
-                $Extra = $DayNames[[int]$Date.DayOfWeek]
-
-                if ($Diff -eq 0) { $Extra = 'сегодня, ' + $Extra }
-                elseif ($Diff -eq 1) { $Extra = 'завтра, ' + $Extra }
-                elseif ($Diff -eq -1) { $Extra = 'вчера, ' + $Extra }
-
-                $Label = '{0} ({1})' -f $Item, $Extra
+            $Entries += [pscustomobject]@{
+                Raw = $Item
+                Day = [int]$Match.Groups[1].Value
+                Month = $Match.Groups[2].Value
+                Year = $Match.Groups[3].Value
             }
-            catch {
-                $Label = $Item
+        }
+        else {
+            $Entries += [pscustomobject]@{ Raw = $Item; Day = 0; Month = ''; Year = '' }
+        }
+    }
+
+    # Группируем даты одного месяца и года: "23 ноября, 24 ноября" -> "23–24 ноября"
+    $Groups = [ordered]@{}
+
+    foreach ($Entry in $Entries) {
+        if ($Entry.Day -eq 0) {
+            $Groups['raw:' + $Entry.Raw] = @($Entry)
+            continue
+        }
+
+        $Key = $Entry.Month + '|' + $Entry.Year
+
+        if (-not $Groups.Contains($Key)) {
+            $Groups[$Key] = @()
+        }
+
+        $Groups[$Key] += $Entry
+    }
+
+    $Lines = @()
+
+    foreach ($Key in $Groups.Keys) {
+        $Group = @($Groups[$Key])
+
+        if ($Group[0].Day -eq 0) {
+            $Lines += $Group[0].Raw
+            continue
+        }
+
+        $Month = $Group[0].Month
+        $Year = $Group[0].Year
+        $Days = @($Group | ForEach-Object { $_.Day } | Sort-Object -Unique)
+
+        # Подряд идущие дни склеиваем в диапазон
+        $Runs = @()
+        $Start = $Days[0]
+        $Prev = $Days[0]
+
+        for ($i = 1; $i -le $Days.Count; $i++) {
+            $Current = $null
+            if ($i -lt $Days.Count) { $Current = $Days[$i] }
+
+            if (($null -ne $Current) -and ($Current -eq ($Prev + 1))) {
+                $Prev = $Current
+                continue
+            }
+
+            if ($Start -eq $Prev) {
+                $Runs += [string]$Start
+            }
+            else {
+                $Runs += ('{0}–{1}' -f $Start, $Prev)
+            }
+
+            if ($null -ne $Current) {
+                $Start = $Current
+                $Prev = $Current
             }
         }
 
-        $Parts += $Label
+        if ($Runs.Count -gt 1) {
+            $DaysText = (($Runs | Select-Object -SkipLast 1) -join ', ') + ' и ' + $Runs[-1]
+        }
+        else {
+            $DaysText = $Runs[0]
+        }
+
+        $Text = '{0} {1}' -f $DaysText, $Month
+
+        if ($Year) {
+            $Text += ' ' + $Year
+
+            # День недели (и "сегодня/завтра" для одной даты)
+            $MonthNumber = [array]::IndexOf($MonthList, $Month) + 1
+            $Weekdays = @()
+            $Relative = ''
+
+            foreach ($Day in $Days) {
+                try {
+                    $Date = [datetime]::new([int]$Year, $MonthNumber, [int]$Day)
+
+                    if ($Days.Count -eq 1) {
+                        $Weekdays += $DayNames[[int]$Date.DayOfWeek]
+
+                        $Diff = ($Date.Date - $Today).Days
+
+                        if ($Diff -eq 0) { $Relative = 'сегодня, ' }
+                        elseif ($Diff -eq 1) { $Relative = 'завтра, ' }
+                        elseif ($Diff -eq -1) { $Relative = 'вчера, ' }
+                    }
+                    else {
+                        $Weekdays += $ShortDays[[int]$Date.DayOfWeek]
+                    }
+                }
+                catch {
+                    # несуществующая дата - день недели не пишем
+                }
+            }
+
+            if ($Weekdays.Count -gt 0) {
+                $Text += ' ({0}{1})' -f $Relative, ($Weekdays -join ', ')
+            }
+        }
+
+        $Lines += $Text
     }
 
-    return ($Parts -join ', ')
+    return @($Lines)
 }
 
 # ============================================================
@@ -1532,7 +1633,19 @@ function Format-PostParts {
     $Facts = @()
 
     if (($Article.Type -in @('outage', 'warning')) -and $Article.Date) {
-        $Facts += ('📅 <b>Когда:</b> {0}' -f (ConvertTo-TgHtml -Text (Format-DateLabel -DateText $Article.Date)))
+        $DateLines = @(Format-DateLabel -DateText $Article.Date)
+
+        if ($DateLines.Count -eq 1) {
+            $Facts += ('📅 <b>Когда:</b> {0}' -f (ConvertTo-TgHtml -Text $DateLines[0]))
+        }
+        elseif ($DateLines.Count -gt 1) {
+            # Несколько разных периодов - каждый с новой строки
+            $Facts += '📅 <b>Когда:</b>'
+
+            foreach ($DateLine in $DateLines) {
+                $Facts += ('• ' + (ConvertTo-TgHtml -Text $DateLine))
+            }
+        }
     }
 
     if (($Article.Type -eq 'outage') -and $Article.Time) {
@@ -1709,8 +1822,8 @@ function Format-ChangeMessage {
     if ($Diff.DateChanged) {
         $Text += ''
         $Text += ('📅 Дата: <s>{0}</s> → {1}' -f
-            (ConvertTo-TgHtml -Text $(if ($Diff.OldDate) { $Diff.OldDate } else { 'не указана' })),
-            (ConvertTo-TgHtml -Text $(if ($Article.Date) { $Article.Date } else { 'не указана' })))
+            (ConvertTo-TgHtml -Text $(if ($Diff.OldDate) { (@(Format-DateLabel -DateText $Diff.OldDate) -join '; ') } else { 'не указана' })),
+            (ConvertTo-TgHtml -Text $(if ($Article.Date) { (@(Format-DateLabel -DateText $Article.Date) -join '; ') } else { 'не указана' })))
     }
 
     if ($Diff.PlaceChanged) {
