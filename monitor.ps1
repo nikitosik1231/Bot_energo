@@ -2104,144 +2104,157 @@ function Send-ChangeNotice {
 function Get-VkWallPosts {
     param([int]$Count = 10)
 
-    # VK может отдавать разную HTML-разметку на разных доменах.
-    # Пробуем основной домен, старый домен и мобильную версию.
-    $WallUrls = @(
-        'https://vk.ru/wall-129160034',
-        'https://vk.com/wall-129160034',
-        'https://m.vk.com/wall-129160034'
-    )
-    $Headers = @{
-        'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-        'Accept' = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        'Accept-Language' = 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
-        'Cache-Control' = 'no-cache'
-        'Pragma' = 'no-cache'
+    if ($Count -lt 1) {
+        throw 'Количество публикаций VK должно быть больше нуля.'
     }
+
+    $Url = 'https://vk.ru/al_wall.php'
+    $Body = @{
+        '__query' = 'wall-129160034'
+        'al'      = '1'
+        'al_id'   = '0'
+    }
+    $Headers = @{
+        'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152.0.0.0 Safari/537.36'
+        'Accept'     = '*/*'
+        'Origin'     = 'https://vk.ru'
+        'Referer'    = 'https://vk.ru/wall-129160034'
+    }
+
+    # Публичная стена загружается анонимным запросом.
+    # Cookies, access token и VK API key не используются.
+    $Response = Invoke-WebRequest `
+        -Uri $Url `
+        -Method POST `
+        -Body $Body `
+        -Headers $Headers `
+        -ContentType 'application/x-www-form-urlencoded' `
+        -UseBasicParsing `
+        -TimeoutSec 30 `
+        -ErrorAction Stop
+
+    if ([int]$Response.StatusCode -ne 200) {
+        throw ('VK вернул HTTP {0}.' -f [int]$Response.StatusCode)
+    }
+
+    $Content = [string]$Response.Content
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        throw 'VK вернул пустой ответ.'
+    }
+
+    # Ответ VK обёрнут в HTML-комментарий: <!--{ JSON }-->
+    $Content = $Content.Trim()
+    if ($Content.StartsWith('<!--')) {
+        $Content = $Content.Substring(4).Trim()
+    }
+    if ($Content.EndsWith('-->')) {
+        $Content = $Content.Substring(0, $Content.Length - 3).Trim()
+    }
+
+    try {
+        $Json = ConvertFrom-Json -InputObject $Content -ErrorAction Stop
+    }
+    catch {
+        throw ('Не удалось разобрать JSON ответа VK: {0}' -f $_.Exception.Message)
+    }
+
+    if ($null -eq $Json.payload -or @($Json.payload).Count -lt 2) {
+        throw 'В ответе VK отсутствует ожидаемый payload. История VK не изменена.'
+    }
+
+    $Html = [string]$Json.payload[1][1]
+    if ([string]::IsNullOrWhiteSpace($Html)) {
+        throw 'VK вернул пустую HTML-разметку стены. История VK не изменена.'
+    }
+
+    # Берём именно контейнеры публикаций, а не все вхождения ID:
+    # один и тот же ID встречается в HTML несколько раз.
+    $PostAttributes = [regex]::Matches(
+        $Html,
+        '(?is)<div\b(?=[^>]*class="[^"]*\bPostContentContainer\b[^"]*")(?=[^>]*data-exec="(?<exec>.*?)")[^>]*>'
+    )
 
     $Posts = @()
     $SeenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $LastHtmlLength = 0
-    $LastUrl = ''
-    $LastError = ''
+    $ParseErrors = 0
 
-    foreach ($WallUrl in $WallUrls) {
+    foreach ($Match in $PostAttributes) {
+        $EncodedExec = $Match.Groups['exec'].Value
+        if ([string]::IsNullOrWhiteSpace($EncodedExec)) {
+            continue
+        }
+
         try {
-            $Response = Invoke-WebRequest -Method Get -Uri $WallUrl -Headers $Headers -UseBasicParsing -TimeoutSec 35 -MaximumRedirection 8 -ErrorAction Stop
-            if ([int]$Response.StatusCode -ne 200) {
-                throw ('VK вернул HTTP {0}' -f [int]$Response.StatusCode)
-            }
-            $Html = [string]$Response.Content
-            $LastHtmlLength = $Html.Length
-            $LastUrl = $WallUrl
-            if ([string]::IsNullOrWhiteSpace($Html)) { continue }
+            $ExecJson = [System.Net.WebUtility]::HtmlDecode($EncodedExec)
+            $Component = ConvertFrom-Json -InputObject $ExecJson -ErrorAction Stop
+            $Item = $Component.'PostContentContainer/init'.item
 
-            # В data-exec JSON хранится в HTML-атрибуте с сущностями &quot;.
-            # Декодируем всю страницу и извлекаем JSON-объекты item независимо
-            # от имени React-компонента и конкретного HTML-контейнера.
-            $DecodedHtml = [System.Net.WebUtility]::HtmlDecode($Html)
-            $ItemMarkers = [regex]::Matches($DecodedHtml, '"item"\s*:\s*\{')
-
-            foreach ($ItemMarker in $ItemMarkers) {
-                $Start = $ItemMarker.Index + $ItemMarker.Length - 1
-                $Depth = 0
-                $InString = $false
-                $Escaped = $false
-                $End = -1
-
-                for ($i = $Start; $i -lt $DecodedHtml.Length; $i++) {
-                    $Ch = $DecodedHtml[$i]
-                    if ($InString) {
-                        if ($Escaped) { $Escaped = $false; continue }
-                        if ($Ch -eq '\') { $Escaped = $true; continue }
-                        if ($Ch -eq '"') { $InString = $false }
-                        continue
-                    }
-                    if ($Ch -eq '"') { $InString = $true; continue }
-                    if ($Ch -eq '{') { $Depth++ }
-                    elseif ($Ch -eq '}') {
-                        $Depth--
-                        if ($Depth -eq 0) { $End = $i; break }
-                    }
-                }
-                if ($End -lt $Start) { continue }
-
-                try {
-                    $ItemJson = $DecodedHtml.Substring($Start, $End - $Start + 1)
-                    $Item = ConvertFrom-Json -InputObject $ItemJson -ErrorAction Stop
-                    $OwnerId = 0L
-                    if ($null -ne $Item.owner_id) { $OwnerId = [long]$Item.owner_id }
-                    elseif ($null -ne $Item.from_id) { $OwnerId = [long]$Item.from_id }
-                    if ($OwnerId -ne -129160034 -or [long]$Item.id -le 0 -or [long]$Item.date -le 0) { continue }
-                    if ([string]::IsNullOrWhiteSpace([string]$Item.text)) { continue }
-                    if (-not $SeenIds.Add([string]$Item.id)) { continue }
-
-                    $PostText = [System.Net.WebUtility]::HtmlDecode([string]$Item.text)
-                    $PostText = $PostText -replace '(?i)<br\s*/?>', "`n"
-                    $PostText = $PostText -replace '(?i)</(?:div|p|li)>', "`n"
-                    $PostText = [regex]::Replace($PostText, '<[^>]+>', ' ')
-                    $PostText = [System.Net.WebUtility]::HtmlDecode($PostText)
-                    $PostText = $PostText -replace "`r`n|`r", "`n"
-                    $PostText = [regex]::Replace($PostText, '[ \t]+', ' ')
-                    $PostText = [regex]::Replace($PostText, '\n{3,}', "`n`n").Trim()
-                    if ([string]::IsNullOrWhiteSpace($PostText)) { continue }
-
-                    $Posts += [pscustomobject]@{
-                        id = [long]$Item.id
-                        owner_id = $OwnerId
-                        date = [long]$Item.date
-                        text = $PostText
-                    }
-                    if ($Posts.Count -ge $Count) { break }
-                }
-                catch { continue }
+            if ($null -eq $Item) {
+                continue
             }
 
-            if ($Posts.Count -gt 0) { break }
+            $OwnerId = [long]$Item.owner_id
+            if ($OwnerId -eq 0 -and $null -ne $Item.from_id) {
+                $OwnerId = [long]$Item.from_id
+            }
 
-            # Дополнительный разбор старой/мобильной разметки: текст публикации
-            # может быть выведен в HTML, даже если JSON-компоненты отсутствуют.
-            # Дату берём из data-date/date атрибутов, если они присутствуют.
-            $PostBlocks = [regex]::Matches(
-                $DecodedHtml,
-                '(?is)(?:id=["'']wpt-129160034_(\d+)["'']|data-post-id=["'']-129160034_(\d+)["'']).{0,30000}?(?:wall_text|wall_post_text|post_content)(.{0,12000}?)(?=(?:id=["'']wpt-129160034_\d+|data-post-id=["'']-129160034_)|\z)'
-            )
-            foreach ($Block in $PostBlocks) {
-                $IdText = if ($Block.Groups[1].Success) { $Block.Groups[1].Value } else { $Block.Groups[2].Value }
-                if ([string]::IsNullOrWhiteSpace($IdText) -or -not $SeenIds.Add($IdText)) { continue }
-                $BlockText = [string]$Block.Groups[3].Value
-                $TextMatch = [regex]::Match($BlockText, '(?is)(?:wall_post_text|wall_text)[^>]*>(.*?)</(?:div|section)>')
-                if (-not $TextMatch.Success) { continue }
-                $PostText = [regex]::Replace($TextMatch.Groups[1].Value, '(?i)<br\s*/?>|</(?:div|p|li)>', "`n")
-                $PostText = [regex]::Replace($PostText, '<[^>]+>', ' ')
-                $PostText = [System.Net.WebUtility]::HtmlDecode($PostText).Trim()
-                if ([string]::IsNullOrWhiteSpace($PostText)) { continue }
-                # Без Unix timestamp этот fallback нельзя безопасно включить в
-                # обработку дат/сроков, поэтому пропускаем его и ждём JSON.
+            $PostId = [long]$Item.id
+            $UnixDate = [long]$Item.date
+            $RawText = [string]$Item.text
+
+            if ($OwnerId -ne -129160034 -or $PostId -le 0 -or $UnixDate -le 0) {
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($RawText)) {
+                continue
+            }
+            if (-not $SeenIds.Add([string]$PostId)) {
+                continue
+            }
+
+            # Сохраняем переносы строк и декодируем HTML-сущности.
+            $PostText = [System.Net.WebUtility]::HtmlDecode($RawText)
+            $PostText = [regex]::Replace($PostText, '(?i)<br\s*/?>', "`n")
+            $PostText = [regex]::Replace($PostText, '(?i)</(?:div|p|li)>', "`n")
+            $PostText = [regex]::Replace($PostText, '<[^>]+>', ' ')
+            $PostText = [System.Net.WebUtility]::HtmlDecode($PostText)
+            $PostText = $PostText.Replace([string][char]0x00A0, ' ')
+            $PostText = $PostText -replace "`r`n|`r", "`n"
+            $PostText = [regex]::Replace($PostText, '[ \t]+', ' ')
+            $PostText = [regex]::Replace($PostText, ' *\n *', "`n")
+            $PostText = [regex]::Replace($PostText, '\n{3,}', "`n`n").Trim()
+
+            if ([string]::IsNullOrWhiteSpace($PostText)) {
+                continue
+            }
+
+            $Posts += [pscustomobject]@{
+                id       = $PostId
+                owner_id = $OwnerId
+                date     = $UnixDate
+                text     = $PostText
             }
         }
         catch {
-            $LastError = $_.Exception.Message
-            Write-Warning ('VK: запрос {0} не удался: {1}' -f $WallUrl, $LastError)
+            $ParseErrors++
             continue
         }
     }
 
     if ($Posts.Count -eq 0) {
-        $WptCount = 0
-        $ExecCount = 0
-        if (-not [string]::IsNullOrWhiteSpace($Html)) {
-            $WptCount = [regex]::Matches($Html, 'wpt-129160034_\d+').Count
-            $ExecCount = [regex]::Matches($Html, 'data-exec\s*=').Count
-        }
-        Write-Warning ('VK: ни один из публичных адресов не вернул читаемые публикации. Последний адрес: {0}; HTML: {1}; data-exec: {2}; wpt: {3}. История не изменена.' -f $LastUrl, $LastHtmlLength, $ExecCount, $WptCount)
-        return @()
+        throw ('Не удалось извлечь публикации из ответа VK. Контейнеров найдено: {0}; ошибок разбора: {1}. История VK не изменена.' -f $PostAttributes.Count, $ParseErrors)
     }
 
-    $SortedPosts = @($Posts | Sort-Object -Property date -Descending | Select-Object -First $Count)
-    Write-Host ('VK: источник {0}; получено публикаций: {1}.' -f $LastUrl, $SortedPosts.Count)
+    $SortedPosts = @(
+        $Posts |
+        Sort-Object -Property date -Descending |
+        Select-Object -First $Count
+    )
+
+    Write-Host ('VK: получено публикаций: {0}; контейнеров найдено: {1}.' -f $SortedPosts.Count, $PostAttributes.Count)
     return @($SortedPosts)
 }
+
 
 function Convert-VkPostToArticle {
     param($Post)
