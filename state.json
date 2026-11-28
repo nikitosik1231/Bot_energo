@@ -305,7 +305,9 @@
   ],
   "initialized": true,
   "subscribers": [
-    -1004496706158
+    -1004496706158,
+    5919862548
   ],
-  "telegram_update_offset": 147031972
+  "telegram_update_offset": 147031973,
+  "articles": []
 }
