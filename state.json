@@ -586,5 +586,7 @@
         }
       ]
     }
-  ]
+  ],
+  "vk_known_ids": [],
+  "vk_initialized": false
 }
